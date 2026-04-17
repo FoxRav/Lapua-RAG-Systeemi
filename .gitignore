@@ -1,0 +1,42 @@
+.venv/
+__pycache__/
+*.pyc
+*.pyo
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+coverage.xml
+htmlcov/
+
+# Cached model weights downloaded on first run
+~/.paddlex/
+models/
+output/
+
+# Runtime data (ingested PDFs, OCR artefacts, indexes, metadata DB)
+data/
+!data/.gitkeep
+
+# Upstream PaddleOCR clone (editable install, not our source)
+PaddleOCR/
+
+# Local experiments / scratch artefacts
+tmp/*.log
+tmp/*.out
+tmp/downloads/
+
+# Secrets
+.env
+.env.local
+*.pem
+*.key
+
+# IDE
+.vscode/
+.idea/
+
+# Build
+build/
+dist/
+*.egg-info/

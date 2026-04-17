@@ -1,0 +1,142 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "lapua-rag"
+version = "0.1.0"
+description = "SOTA local RAG platform for Finnish municipal documents with Qwen2.5 + LoRA"
+readme = "README.md"
+requires-python = ">=3.10,<3.11"
+license = { text = "Proprietary" }
+authors = [{ name = "CCG-FAKTUM" }]
+keywords = ["rag", "ocr", "paddleocr", "qwen", "lora", "finnish", "municipal"]
+
+dependencies = [
+  "paddleocr",
+  "paddlepaddle-gpu>=3.3.1",
+  "paddlex",
+  "transformers>=4.57",
+  "peft>=0.19",
+  "accelerate",
+  "sentence-transformers>=5.0",
+  "lm-format-enforcer>=0.11",
+  "qdrant-client>=1.17",
+  "sqlmodel>=0.0.38",
+  "pydantic>=2.9",
+  "pydantic-settings>=2.13",
+  "fastapi>=0.136",
+  "uvicorn[standard]>=0.44",
+  "httpx>=0.28",
+  "tenacity>=9.0",
+  "typer[all]>=0.24",
+  "structlog>=25.0",
+  "watchdog>=6.0",
+  "rank-bm25>=0.2",
+  "snowballstemmer>=3.0",
+  "pandas>=2.3",
+  "pyarrow>=23.0",
+  "pypdfium2>=5.7",
+  "beautifulsoup4",
+  "lxml",
+  "rich>=15.0",
+]
+
+[project.optional-dependencies]
+dev = [
+  "pytest>=9.0",
+  "pytest-asyncio>=1.0",
+  "pytest-cov>=7.0",
+  "ruff>=0.15",
+  "mypy>=1.20",
+  "black>=26.0",
+  "isort>=8.0",
+  "types-requests",
+]
+mcp = ["paddleocr_mcp", "mcp", "fastmcp"]
+
+[project.scripts]
+lapua-rag = "lapua_rag.cli:app"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+include = ["lapua_rag*"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py310"
+src = ["src", "tests"]
+
+[tool.ruff.lint]
+select = [
+  "E", "F", "W",        # pycodestyle / pyflakes
+  "I",                  # isort
+  "B",                  # bugbear
+  "UP",                 # pyupgrade
+  "ANN",                # missing annotations
+  "SIM",                # simplify
+  "RET",                # return
+  "PL",                 # pylint-subset
+  "RUF",                # ruff-specific
+]
+ignore = [
+  "ANN401",             # Any allowed when commented
+  "PLR0913",            # too many arguments
+  "PLR2004",            # magic values
+  "RUF001",             # ambiguous unicode chars are intentional (Finnish text)
+  "RUF002",             # same for docstrings
+]
+
+[tool.ruff.lint.per-file-ignores]
+"tests/**/*" = ["ANN", "PLR", "S101"]
+# Deferred heavy-ML imports (torch, transformers, paddleocr, sentence_transformers).
+# Rationale: loading these at module-import time adds 2-5s to every CLI invocation
+# (including `--help`). Imports live inside the single `_ensure_loaded` method.
+# Exception documented per user rule (no-inline-imports).
+"src/lapua_rag/ocr/pipeline.py" = ["PLC0415"]
+"src/lapua_rag/embed/embedder.py" = ["PLC0415"]
+"src/lapua_rag/rerank/reranker.py" = ["PLC0415"]
+"src/lapua_rag/extract/llm.py" = ["PLC0415"]
+"src/lapua_rag/index/qdrant.py" = ["PLC0415"]
+"src/lapua_rag/mcp/server.py" = ["PLC0415"]
+"src/lapua_rag/api/routes/query.py" = ["PLC0415"]
+
+[tool.mypy]
+python_version = "3.10"
+strict = true
+disallow_untyped_defs = true
+disallow_untyped_calls = true
+warn_return_any = true
+warn_unused_ignores = true
+no_implicit_optional = true
+files = ["src/lapua_rag"]
+
+[[tool.mypy.overrides]]
+module = [
+  "paddleocr.*",
+  "paddlex.*",
+  "paddle.*",
+  "pypdfium2.*",
+  "snowballstemmer.*",
+  "rank_bm25.*",
+  "lmformatenforcer.*",
+  "pandas.*",
+  "pyarrow.*",
+  "bs4.*",
+]
+ignore_missing_imports = true
+
+[tool.pytest.ini_options]
+minversion = "9.0"
+testpaths = ["tests"]
+asyncio_mode = "auto"
+addopts = "-ra --strict-markers --cov=lapua_rag --cov-report=term-missing"
+
+[tool.black]
+line-length = 100
+target-version = ["py310"]
+
+[tool.isort]
+profile = "black"
+line_length = 100
+src_paths = ["src", "tests"]

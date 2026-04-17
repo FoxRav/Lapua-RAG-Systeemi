@@ -1,0 +1,33 @@
+# Additional optional components on top of paddleocr[all]
+# Installed after editable paddleocr[all] + paddlepaddle-gpu cu118.
+
+# Serving / high-stability deployment (paddlex HPS)
+paddlex[serving]>=3.4.0,<3.5.0
+fastapi>=0.123
+uvicorn[standard]>=0.35
+
+# Root-level training / heavy-image deps from PaddleOCR/requirements.txt
+scikit-image
+lmdb
+rapidfuzz
+opencv-python
+cython
+albumentations
+albucore
+
+# ONNX runtime + converter (high-performance inference path)
+paddle2onnx
+onnxruntime-gpu
+
+# Document recovery / layout / MD export deps
+python-docx
+beautifulsoup4
+fonttools>=4.43.0
+fire>=0.3.0
+pypandoc-binary
+
+# KIE training helpers (paddlenlp pinned to 2.5.2 intentionally omitted;
+# it conflicts with modern paddle. Install separately if training KIE.)
+yacs
+seqeval
+attrdict3
