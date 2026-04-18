@@ -68,7 +68,109 @@ omalla Systeemillä + LoRA-adapterilla per asiakas.
 - Multi-tenant-todennus (tenant-kenttä on rakenteessa, ACL-kerros puuttuu).
 - Prometheus-metriikka, auditloki, UI (Streamlit / Next.js).
 - LLM-as-judge eval-skripti ja Lapuan kultajoukko-dataset.
-- vLLM-palvelun pystytys Linuxille.
+
+### v0.3 · 2026-04-18 – vLLM-synteesi tuotantonopeudella
+
+- **109 dokumenttia, 7 922 chunkia, 1.13 M tokenia** indeksoitu Qdrantiin
+  (`scripts/batch_ingest.py`, 108 PDF:ää DATA_päättävät_elimet_20251202 → 11 h 15 min
+  OCR+embed, extraction skipattu).
+- **vLLM WSL2-distrossa pystyyn** (`lapua-vllm` / F:\wsl\lapua-vllm, Ubuntu 22.04).
+  Qwen2.5-1.5B bf16 + lapua-llm-v2 LoRA rinnakkain `--lora-modules lapua-v2=…`,
+  OpenAI-endpoint `http://localhost:8000/v1`. Ks. §10.
+- **`lapua-rag query` vLLM-backendilla end-to-end:** vastaus ~15 s (LLM osuus
+  1–3 s, loput embedding/reranker mallilatauksia CLI-prosessissa; FastAPI
+  `_answer_service()` on `lru_cache`d → toisen kyselyn latenssi pelkkä LLM-aika).
+- **Closed-book-vahtikoira validoitu elävällä mallilla** – LoRA palauttaa
+  "En löydä Systeemistä vastausta" kysymyksille joihin kontekstin
+  max_source_score < kynnys.
+
+### v0.5 · 2026-04-18 – Systeemi-frontend (Next.js + shadcn/ui)
+
+Tähän asti Systeemiä on ajettu CLI:stä ja FastAPI:n raakana
+JSON-rajapintana — toimivaa, mutta ei sellaisesta kiitellä korpuksen
+tutkimisesta. v0.5:ssä saatiin täysi web-UI tuotantolaadulla:
+
+- **`frontend/`** — Next.js 16 + React 19 + Tailwind 4 + shadcn/ui
+  (base-nova preset, Base UI primitiivit). Yhden käyttäjän käyttöön
+  optimoitu, mutta koodirakenne kestää myös asiakasdemoa.
+- **Tyyppiturva backendin → frontendin yli**: `frontend/scripts/gen-types.mjs`
+  generoi TypeScript-tyypit `lib/api/openapi.d.ts`:ään suoraan FastAPI:n
+  OpenAPI-spekin pohjalta (`openapi-typescript`). Skripti yrittää ensin
+  livesessiota (`/openapi.json`), fallbackaa offlineen `tmp/openapi.json`:iin.
+  CLI-tuki: `lapua-rag openapi-dump` kirjoittaa specin levylle ilman
+  serveriä.
+- **Komponenttirakenne** (`frontend/components/`):
+  - `chat-panel.tsx` — chat-näkymä, Ctrl+Enter lähettää, optimistinen
+    pending-tila skeletoneilla, virhekäsittely toastilla.
+  - `answer-card.tsx` — johtopäätös + perustelut markdown-renderöitynä,
+    abstain-bannerit per syy (`no_context`, `below_threshold`,
+    `model_refused`), reranker-score-mittari.
+  - `source-card.tsx` — doc_id (klikkaa → kopioi), sivu, section,
+    score-badge, snippet → "Näytä koko chunk" lazy-fetchaa
+    `GET /v1/chunks/{chunk_id}`.
+  - `pdf-viewer.tsx` — Dialog-modaali, iframe selaimen sisäänrakennettuun
+    PDF-katsojaan `#page=N&zoom=page-fit`-ankkurilla.
+  - `system-sidebar.tsx` — korpus-stats, kattavuus per doc_type, versio,
+    **mode-toggle** (synth ↔ retrieve, persistoidaan LocalStorage:iin).
+  - `query-history.tsx` — viimeiset 20 kyselyä LocalStorage:sta, klikkaa
+    → injektoi inputtiin.
+  - `theme-toggle.tsx` — light / dark / system, `next-themes` SSR-safe.
+- **Backend-laajennukset**:
+  - `QueryRequest.mode: AnswerMode | None` — per-pyyntö override
+    `Settings.answer_mode`:lle. `_answer_service` cachetetaan moodikohtaisesti
+    (`lru_cache(maxsize=2)`), joten embedder/reranker eivät uudelleenladata.
+  - `GET /v1/documents/{doc_id}/source` — striimaa PDF:n
+    `data/storage/<tenant>/YYYY/MM/<doc_id>/source.pdf`-polusta inline-PDF:nä,
+    selain renderöi sen sisäänrakennetulla katsojallaan.
+  - `GET /v1/chunks/{chunk_id}` — koko chunkin teksti + metadata,
+    backend "näytä koko chunk" -ekspanderille.
+  - `RagSource.chunk_id` — uusi kenttä jotta UI tietää mitä chunkia
+    pyytää koko tekstiksi (oletus optional, taaksepäin yhteensopiva).
+- **Tiedonkulku UI ↔ taustapalvelut**: TanStack Query cachettaa
+  `system/stats|coverage|version` ja `chunks/{id}` -hauista 30 s, kyselyt
+  itse menevät `useMutation`-kautta ilman cachea (jokainen kysely tuore).
+- **CLI: `lapua-rag ui`** — käynnistää Next.js dev-serverin
+  (`frontend/`) subprocessina; `--install` ajaa `npm install`:n
+  ensimmäisellä kerralla.
+- **5 uutta backend-yksikkötestiä** (`test_api_documents.py`,
+  `test_api_query.py`): PDF-streaming + 404-haarat, chunk-endpointti,
+  `mode`-overriden + `Literal`-validoinnin, kaikki yhteensä **46 testiä
+  vihreänä**. `next build` + `tsc --noEmit` puhtaita.
+
+Suosittu kysely-flow: open `http://localhost:3000` → kirjoita kysymys →
+pieni *retrieve*-badge top-oikealla näyttää aktiivisen tilan → 5 lähde-
+korttia, joista jokainen aukeaa sekä koko-chunk-näkymäksi että PDF:n
+oikealla sivulla.
+
+### v0.4 · 2026-04-18 – AnswerService kestäväksi: retrieve-mode + diagnoosit
+
+Diagnostinen ajo (`tmp/debug_query.py`) paljasti että `lapua-llm-v2` LoRA on
+ylikoulutettu kieltäytymään: malli palautti *"En löydä Systeemistä vastausta"*
+vaikka rerankerin top-1 score oli 0.99 ja chunkki sisälsi vastauksen sanasta
+sanaan (ks. §11). Pelkkä prompti- tai parametriviritys ei riittänyt — even
+few-shot-esimerkki ei muuttanut käytöstä. Korjattu rakenteellisesti:
+
+- **`AnswerService` jaettu kahteen moodiin** (`Settings.answer_mode`):
+  - `synth` = retrieve → rerank → vLLM extracts JSON (alkuperäinen polku)
+  - `retrieve` = retrieve → rerank → palauta top-N siteeratut katkelmat,
+    LLM ohitetaan kokonaan. **Tällä hetkellä default `.env`:ssä**, koska
+    tuottaa luotettavasti relevantteja vastauksia ilman synteesimallin
+    virhepäätöksiä.
+- **AnswerService-parametrit Settings:iin** (`LAPUA_ANSWER_*`): mode,
+  min_score, max_context_chunks (3 → 5, vastaa rerankerin top_k_final:ia),
+  max_chars_per_chunk (800 → 1500), retrieve_snippet_chars (600).
+- **Abstain-recovery**: jos LoRA palauttaa abstain-tekstin mutta unohtaa
+  flagin, post-processor flippaa `abstained=true`.
+- **Diagnostinen `rag.llm_call`-loki**: kirjaa n_chunks, context_chars,
+  top_score → silent truncationit ja chunk-cap-mismatchit nyt näkyvissä.
+- **Few-shot esimerkki promptissa** (synth-modea varten, kestävä koodi
+  lapua-llm-v3:n tullessa).
+- **40 yksikkötestiä vihreinä** (ml. 4 uutta retrieve-mode + abstain-recovery
+  -testiä; testit ajavat ilman Qwen-latausta `_RecordingLlm`-mockilla).
+- **Smoke-testi onnistunut**: kyselyllä *"Kuka valittiin Jytyn pääluottamus-
+  mieheksi Lapualla?"* retrieve-mode palauttaa 5 lähdettä joista top-1
+  (score 0.99) sisältää suoran vastauksen *"Samuli Taivalmaan kaudelle
+  2025-2028"*.
 
 ---
 
@@ -198,7 +300,13 @@ lapua-rag system coverage    # indeksoitu / kesken / epäonnistunut per doc_type
 
 # 7. Nosta HTTP-API
 lapua-rag serve    # → http://127.0.0.1:8080/docs
+
+# 8. Nosta web-UI (uudessa terminaalissa, vaatii Node 20+)
+lapua-rag ui --install   # ekan kerran (asentaa frontend/node_modules:n)
+lapua-rag ui             # jatkossa  → http://localhost:3000
 ```
+
+> Vaihtoehtoisesti `cd frontend && npm install && npm run dev`.
 
 ### HTTP-API (FastAPI)
 
@@ -238,11 +346,13 @@ Tärkeimmät:
 | `LAPUA_LLM_LORA`                 | `CCG-FAKTUM/lapua-llm-v2`            | **Per-asiakas LoRA-adapteri**    |
 | `LAPUA_LLM_DEVICE`               | `cpu`                                | Windows-MVP; Linuxissa `cuda`    |
 | `LAPUA_LLM_VLLM_URL`             | tyhjä                                | Aseta → transparent remote vLLM  |
+| `LAPUA_LLM_VLLM_MODEL`           | `lapua-v2`                           | LoRA-moduulin nimi (vastaa `--lora-modules <nimi>=<path>`) |
 | `LAPUA_OCR_DEVICE`               | `gpu:0`                              | Paddle-laitevalinta              |
-| `LAPUA_ANSWER_MIN_SCORE`*        | `0.0`                                | Rerank-kynnys closed-book-guardille |
-
-*) suunniteltu; tällä hetkellä kynnys asetetaan `AnswerService(min_score=…)`
-konstruktorissa. README päivittyy kun settings-kentät ovat käytössä.
+| `LAPUA_ANSWER_MODE`              | `synth`                              | `synth`=LLM-synteesi, `retrieve`=top-N siteeratut katkelmat (suositus kunnes lapua-llm-v3 valmis) |
+| `LAPUA_ANSWER_MIN_SCORE`         | `0.0`                                | Rerank-kynnys closed-book-guardille |
+| `LAPUA_ANSWER_MAX_CONTEXT_CHUNKS`| `5`                                  | LLM:lle/käyttäjälle näkyvien chunkien määrä |
+| `LAPUA_ANSWER_MAX_CHARS_PER_CHUNK`| `1500`                              | Per-chunk merkkibudjetti synth-modessa |
+| `LAPUA_ANSWER_RETRIEVE_SNIPPET_CHARS`| `600`                            | Per-source snippet retrieve-modessa |
 
 Multi-tenant: uusi asiakas = uusi `tenant`-arvo + **oma Systeemi**
 (eristetty `storage/<tenant>/` + per-tenant Qdrant-filtteri + per-tenant
@@ -481,10 +591,13 @@ files in `site-packages`** if you duplicate this venv elsewhere.
    incompatible with modern PaddlePaddle and is intentionally **not**
    installed. Needed only for *training* KIE models; inference works
    without it.
-4. **6 GB VRAM**: PaddleOCR-VL-0.9B and PP-StructureV3 run comfortably.
-   Qwen2.5-1.5B in bf16 requires ~4 GB; running OCR *and* Qwen on the same
-   GPU simultaneously will OOM. Use CPU for Qwen on Windows, or offload
-   Qwen to a separate Linux host via `LAPUA_LLM_VLLM_URL`.
+4. **6 GB VRAM is shared, not concurrent.** PP-StructureV3 / PaddleOCR-VL
+   consume ~4 GB during ingest. vLLM serving Qwen2.5-1.5B bf16 + LoRA in
+   the `lapua-vllm` WSL2 distro reserves ~4.5 GB (2.89 GB weights + 0.3 GB
+   KV cache @ 4096 tokens + 1.4 GB peak activations + 0.21 GB non-torch).
+   **You cannot run ingest (OCR) and query (vLLM) at the same time** – the
+   second allocator will OOM. Run them sequentially, or stop vLLM before
+   ingesting by killing the `lapua-vllm` distro’s `vllm serve` process.
 5. **`torch==2.5.1+cpu`** is the pinned build. torch 2.11 ships a broken
    `shm.dll` on this box even with the pre-load hook; do not upgrade
    without re-verifying.
@@ -539,3 +652,256 @@ pytest tests/unit -q --no-cov
 ruff check src tests
 lapua-rag --help
 ```
+
+---
+
+## 10. vLLM WSL2 -pystytys (production answer path)
+
+Tämä reitti on tarkoitettu yhden kysyjän työasemalle, jossa Windows-puolella on
+Lapua-RAG + PaddleOCR ja **CUDA on saatavilla ainoastaan WSL2:n läpi**. vLLM ei
+toimi natiivisti Windowsissa, joten Qwen-synteesi siirretään erilliseen
+WSL2-distroon, joka puhuu OpenAI-yhteensopivaa REST-API:a `localhost:8000`:sta.
+Windows-Lapua-RAG näkee sen `LAPUA_LLM_VLLM_URL`:n kautta.
+
+**Esivaatimukset:** WSL 2.4+ (testattu 2.5.9), NVIDIA-ajuri ≥ 555 Windowsissa
+(testattu 581.04), ~15 GB vapaata levyä kohdeasemalla (malli + venv), GPU
+jossa ≥ 5 GB vapaata VRAM:ia kun OCR ei aja.
+
+### 10.1 Ubuntu-distron asennus valitulle levyasemalle
+
+```powershell
+# F-asema koska C: oli ahdas; vaihda sijainti tarpeen mukaan
+New-Item -ItemType Directory -Force -Path F:\wsl\lapua-vllm
+wsl --install Ubuntu-22.04 --location F:\wsl\lapua-vllm --name lapua-vllm --no-launch
+wsl -d lapua-vllm -- bash -c "nvidia-smi --query-gpu=name,memory.free --format=csv,noheader"
+# pitäisi näkyä "NVIDIA GeForce RTX 4050 Laptop GPU, 5036 MiB"
+```
+
+### 10.2 Python + vLLM
+
+```bash
+# sisällä lapua-vllm-distrossa, root-tilillä
+apt-get update && apt-get install -y --no-install-recommends \
+    python3.10 python3.10-venv python3.10-dev build-essential git curl ca-certificates
+python3.10 -m venv /root/vllm-venv
+/root/vllm-venv/bin/pip install --upgrade pip wheel
+/root/vllm-venv/bin/pip install 'vllm==0.6.6.post1'
+# vllm 0.6.6 odottaa transformers 4.x:ää; uusin 5.x rikkoo tokenizerin
+/root/vllm-venv/bin/pip install 'transformers<5.0,>=4.45'
+```
+
+**Kolme varoitusta:**
+
+- Triton (vllm:n riippuvuus) kääntää runtime-kernelit gcc:llä → tarvitsee
+  `python3.10-dev`-paketin (Python.h). Ilman sitä `profile_run` kaatuu.
+- `transformers>=5` poistaa `Qwen2Tokenizer.all_special_tokens_extended`:n
+  → vllm 0.6.6 virheilmoittaa tokenizerin alustuksessa.
+- WSL2:n ZMQ-stack ei tue `zmq_poll(timeout=-1)`:tä → käytä
+  `--disable-frontend-multiprocessing` (ajaa enginen samassa prosessissa).
+
+### 10.3 Mallien esilataus HF-cacheen
+
+```bash
+# prefetch ennen ensimmäistä startia jotta käynnistys ei odota latausta
+python /mnt/f/-DEV-/76.PaddleOCR/tmp/hf_prefetch.py
+# → /root/.cache/huggingface/hub/models--Qwen--Qwen2.5-1.5B-Instruct/...
+# → /root/.cache/huggingface/hub/models--CCG-FAKTUM--lapua-llm-v2/...
+```
+
+### 10.4 vllm serve -käynnistys
+
+Skripti `tmp/start_vllm.sh` (committed) vie nämä kaikki oikein:
+
+```bash
+/root/vllm-venv/bin/vllm serve Qwen/Qwen2.5-1.5B-Instruct \
+    --enable-lora --max-loras 1 --max-lora-rank 16 \
+    --lora-modules "lapua-v2=/root/.cache/huggingface/hub/models--CCG-FAKTUM--lapua-llm-v2/snapshots/<sha>" \
+    --max-model-len 4096 --gpu-memory-utilization 0.80 --dtype bfloat16 \
+    --enforce-eager --disable-frontend-multiprocessing \
+    --guided-decoding-backend outlines \
+    --host 0.0.0.0 --port 8000 --disable-log-requests
+```
+
+Keskeiset valinnat pienelle 6 GB VRAM:ille:
+
+- `--enforce-eager` ohittaa CUDA-graph-cachen (säästää ~0.5 GB).
+- `--max-model-len 4096` pitää KV-cachen pienenä (~0.3 GB); AnswerService
+  lähettää alle 1 k tokenia per kutsu.
+- `--max-loras 1 --max-lora-rank 16` vastaa `lapua-llm-v2`:n `adapter_config.json`:ia.
+- `--guided-decoding-backend outlines` – xgrammar 0.1.33 rikkoo `TokenizerInfo`-API:n.
+
+### 10.5 Windowsista käyttö
+
+```powershell
+# .env
+LAPUA_LLM_VLLM_URL=http://localhost:8000/v1
+LAPUA_LLM_VLLM_MODEL=lapua-v2
+```
+
+WSL 2.4+ välittää `localhost:8000` Windowsin puolelta automaattisesti distroon
+(ei tarvita `wsl hostname -I`:tä eikä Windows Defender -sääntöjä).
+Testi:
+
+```powershell
+curl http://localhost:8000/v1/models                 # listaa Qwen + lapua-v2
+lapua-rag query "Mitä päätettiin § 123 kokouksessa?" # end-to-end
+```
+
+### 10.6 GPU-konflikti ingestin kanssa
+
+OCR-pipeline ja vLLM molemmat varaavat ~4 GB VRAM:ia. 6 GB kortilla ne eivät
+mahdu yhtäaikaa. Käytännön työjärjestys:
+
+1. `wsl -d lapua-vllm -- pkill -f "vllm serve"` – vapauta GPU
+2. `lapua-rag ingest-dir <dir>` tai `python scripts/batch_ingest.py ...`
+3. `wsl -d lapua-vllm -- bash /root/start_vllm.sh` – käynnistä vLLM takaisin
+4. `lapua-rag query ...` / `lapua-rag serve` (FastAPI)
+
+---
+
+## 11. Avoin tiketti: lapua-llm-v3 retrain (ylikoulutettu abstain)
+
+### Juurisyy
+
+`lapua-llm-v2` LoRA-painot palauttavat **deterministisesti**
+*"En löydä Systeemistä vastausta tähän kysymykseen"* myös silloin kun
+retrieval-kontekstissa on vastauksen exact-match. Diagnoosi (`tmp/debug_query.py`,
+2026-04-18):
+
+| Mittari | Havainto |
+|---|---|
+| Reranker top-1 score | 0.99 (BGE reranker-v2-m3) |
+| Top-1 chunk sisältö | *"Jytyn vaalitoimikunta on päättänyt valita Lapuan kaupungin uudeksi pääluottamusmieheksi Samuli Taivalmaan kaudelle 2025-2028."* |
+| lapua-v2 vastaus    | Abstain-template (model_refused) |
+| Base Qwen vastaus   | Rikkinäinen JSON (`"johtopaatos": "johtopaatos"` literal placeholder) |
+| Few-shot kokeilu    | Ei vaikutusta lapua-v2:n käytökseen |
+
+→ Ongelma on **mallin painoissa**, ei promptissa eikä parametreissa.
+Koulutusdata oli ilmeisesti voimakkaasti vinoutunut kieltäytymisesimerkkeihin.
+
+### Korjaus (lapua-llm-v3)
+
+1. **Tasapainota koulutusdata 50/50** abstain vs. extract -esimerkkien välillä.
+   Nykyinen suhde on tuntematon mutta ilmeisesti > 80/20 abstain-painotteinen.
+2. **Lisää positiivisia extract-esimerkkejä** suomenkielisistä päätös-
+   teksteistä: kuka valittiin / mitä päätettiin / milloin astuu voimaan -tyyppiä.
+   Tavoite: ≥ 200 (chunk → JSON) -paria joissa vastaus on chunkissa.
+3. **Säilytä JSON-skema-koulutus**: nykyinen v2 outputtaa syntaktisesti oikeaa
+   JSON:ia — tämä on ainoa asia jonka v2 osaa paremmin kuin base.
+4. **Validointi koulutuksen jälkeen**: 10 kontrollikyselyä joista 5:llä on
+   suora vastaus indeksissä, 5:llä ei. Hyväksymiskriteeri: ≥ 4/5 oikeaa
+   extract:ia, ≥ 4/5 oikeaa abstainia.
+5. **Deploy**: julkaise `CCG-FAKTUM/lapua-llm-v3`, päivitä
+   `LAPUA_LLM_LORA=CCG-FAKTUM/lapua-llm-v3` ja vaihda `LAPUA_ANSWER_MODE=synth`.
+
+### Sillaikaa
+
+`LAPUA_ANSWER_MODE=retrieve` (tämän commitin default `.env`:ssä) tuottaa
+luotettavasti relevantteja vastauksia — käyttäjä lukee top-N siteeratut
+katkelmat suoraan. Closed-book-guarantee säilyy, hallusinaatioriski = 0,
+relevanttiusarvio reranker-scoreissa näkyvissä.
+
+### Aikataulu
+
+1–2 päivää: datan revisio + LoRA-koulutus (RTX 4050, 1.5B base, r=16, ~2 h
+per epoch × 3-5 epochia), validointi, julkaisu.
+
+---
+
+## 12. Frontend (Systeemi-UI, `frontend/`)
+
+### 12.1 Stack
+
+| Komponentti       | Versio | Miksi                                                              |
+|-------------------|--------|--------------------------------------------------------------------|
+| Next.js (App)     | 16     | Stabiili App Router + Turbopack dev. SSR ei pakollinen, mutta saadaan ilmaiseksi. |
+| React             | 19     | Vakaa peer Next 16:lle.                                            |
+| Tailwind CSS      | 4      | CSS-muuttujat = vaivaton dark mode.                                |
+| shadcn/ui         | base-nova preset | Base UI -primitiivit (`@base-ui/react`) — tyylittelee shadcn:n logiikkaa, ei lukitse Radixiin. |
+| TanStack Query    | 5      | Stats/version/coverage cache; mutaatiot kysely-flowiin.           |
+| react-markdown    | latest | Johtopäätös + perustelut markdown-renderöitynä (GFM-taulukot).    |
+| openapi-typescript | 7     | Generoi TypeScript-tyypit FastAPI:n OpenAPI-spekistä.              |
+| next-themes       | latest | Light/dark/system, SSR-safe (`suppressHydrationWarning`).          |
+| sonner            | latest | Toastit (verkko/abstain).                                          |
+
+### 12.2 Dev-flow
+
+```powershell
+# Terminal 1 – backend
+cd F:\-DEV-\76.PaddleOCR
+.\.venv\Scripts\Activate.ps1
+lapua-rag serve                # → http://localhost:8080
+
+# Terminal 2 – WSL2 vLLM (vain jos LAPUA_ANSWER_MODE=synth)
+wsl -d lapua-vllm -- bash /root/start_vllm.sh    # → http://localhost:8000
+
+# Terminal 3 – frontend
+lapua-rag ui --install         # ekan kerran
+lapua-rag ui                   # → http://localhost:3000
+```
+
+### 12.3 OpenAPI → TypeScript
+
+Tyypit ovat **autogeneroituja** — backendin `RagAnswer` ja kaverit
+muotoutuvat suoraan `frontend/lib/api/openapi.d.ts`:ksi. Kun muutat backendin
+Pydantic-skeemoja, päivitä tyypit:
+
+```powershell
+# vaihtoehto A — backend pyörii
+cd frontend
+npm run gen-types
+
+# vaihtoehto B — backend ei pyöri (CI / offline)
+lapua-rag openapi-dump          # tmp/openapi.json
+cd frontend
+npm run gen-types               # fallbackaa offlineen
+```
+
+Generoitu `openapi.d.ts` on **gitignoroitu** koska se on aina
+johdannainen FastAPI-skeemasta — git-historian saastuttaminen ei ole
+arvonsa väärti.
+
+### 12.4 Komponenttikartta (`frontend/`)
+
+```
+frontend/
+├── app/
+│   ├── layout.tsx          # html lang=fi, suppressHydrationWarning, Providers
+│   ├── page.tsx            # main shell (chat | sidebar grid)
+│   └── globals.css         # Tailwind 4 + shadcn theme tokens
+├── components/
+│   ├── providers.tsx       # ThemeProvider + QueryClientProvider + TooltipProvider + Toaster
+│   ├── header.tsx          # logo + theme-toggle
+│   ├── theme-toggle.tsx    # light/dark/system kierto
+│   ├── chat-panel.tsx      # textarea + viestihistoria, Ctrl+Enter
+│   ├── answer-card.tsx     # markdown-render, abstain-banner, score-meter
+│   ├── source-card.tsx     # doc_id+sivu+score, snippet → koko chunk lazy
+│   ├── pdf-viewer.tsx      # Dialog + iframe browser PDF viewerille
+│   ├── system-sidebar.tsx  # stats/coverage/version + mode-toggle
+│   ├── query-history.tsx   # LocalStorage history (max 20)
+│   └── ui/                 # shadcn-generoidut primitiivit
+├── lib/
+│   ├── api/
+│   │   ├── client.ts       # typed fetch wrapper, ApiError
+│   │   └── openapi.d.ts    # ⚠ autogen, gitignored
+│   ├── history.ts          # LocalStorage-helperit
+│   └── utils.ts            # shadcn cn()
+└── scripts/
+    └── gen-types.mjs       # OpenAPI → TS, live-fallback offlineen
+```
+
+### 12.5 Tuotanto-build (myöhemmin)
+
+Toistaiseksi UI ajetaan dev-tilassa (`npm run dev`). Tuotantokäyttöön
+kaksi vaihtoehtoa kun aika tulee:
+
+1. **Itsenäinen Node-prosessi**: `npm run build && npm run start`
+   (port 3000), backend FastAPI port 8080 — selkeä erottelu, helppo
+   skaalata erikseen.
+2. **Static export FastAPI:n alle**: `next export` → `out/`-kansio,
+   palvellaan FastAPI:n `/static/`-mountista yhdellä portilla (8080).
+   Yhden binäärin/Docker-imagen deploy. Vaatii että UI ei käytä
+   server-rendered route-kohtaista tilaa (tällä hetkellä ei käytä).
+
+Kumpaakin ei tarvita ennen kuin Systeemiä on tarkoitus jakaa toiselle
+käyttäjälle — yksilökäytössä `lapua-rag ui` riittää.

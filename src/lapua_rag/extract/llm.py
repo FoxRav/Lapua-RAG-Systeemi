@@ -176,9 +176,12 @@ def default_client() -> LlmClient:
     """Factory: remote vLLM when configured, otherwise local."""
     settings = get_settings()
     if settings.llm_vllm_url:
+        # Prefer the explicit LoRA module name (e.g. "lapua-v2") so the adapter
+        # is applied; fall back to the base HF id if no LoRA is registered.
+        vllm_model = settings.llm_vllm_model or settings.llm_base
         return RemoteVllmClient(
             base_url=settings.llm_vllm_url.rstrip("/"),
-            model=settings.llm_base,
+            model=vllm_model,
             max_new_tokens=settings.llm_max_new_tokens,
         )
     return LocalLlmClient(

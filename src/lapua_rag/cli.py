@@ -7,10 +7,16 @@ Usage::
     lapua-rag ingest-dir path/to/folder      # ingest a folder
     lapua-rag query "Mitä § 78 koskee?"
     lapua-rag serve                          # run FastAPI on port 8080
+    lapua-rag ui                             # run Next.js frontend dev server
+    lapua-rag openapi-dump                   # write OpenAPI JSON for gen-types
 """
 
 from __future__ import annotations
 
+import json
+import os
+import shutil
+import subprocess
 from pathlib import Path
 
 import typer
@@ -18,6 +24,7 @@ import uvicorn
 from rich import print as rprint
 from rich.table import Table
 
+from lapua_rag.api.app import create_app
 from lapua_rag.api.routes.query import _answer_service
 from lapua_rag.config import get_settings
 from lapua_rag.db.session import create_all
@@ -98,7 +105,7 @@ def ingest_dir(
 def query(question: str, tenant: str | None = None) -> None:
     """Ask a question against the indexed corpus."""
     settings = get_settings()
-    svc = _answer_service()
+    svc = _answer_service(settings.answer_mode)
     answer = svc.answer(query=question, tenant=tenant or settings.tenant)
     rprint(answer.model_dump_json(indent=2))
 
@@ -113,6 +120,70 @@ def serve(host: str | None = None, port: int | None = None) -> None:
         host=host or settings.api_host,
         port=port or settings.api_port,
         reload=False,
+    )
+
+
+@app.command()
+def ui(
+    port: int = typer.Option(3000, help="Port for the Next.js dev server."),
+    install: bool = typer.Option(
+        False,
+        "--install/--no-install",
+        help="Run `npm install` in frontend/ before starting (first-run setup).",
+    ),
+) -> None:
+    """Run the Next.js frontend dev server (frontend/).
+
+    The backend (`lapua-rag serve`) must be running separately on the URL
+    pointed at by `frontend/.env.local`'s NEXT_PUBLIC_API_URL.
+    """
+    repo_root = Path(__file__).resolve().parents[2]
+    frontend_dir = repo_root / "frontend"
+    if not (frontend_dir / "package.json").is_file():
+        raise typer.BadParameter(
+            f"frontend/ not found at {frontend_dir}; did the repo move?",
+        )
+
+    npm = shutil.which("npm")
+    if npm is None:
+        raise typer.BadParameter(
+            "npm not found on PATH. Install Node.js 20+ from https://nodejs.org/.",
+        )
+
+    if install:
+        rprint("[bold]Running `npm install`...[/bold]")
+        subprocess.run([npm, "install", "--no-fund", "--no-audit"], cwd=frontend_dir, check=True)
+
+    env = {**os.environ, "PORT": str(port)}
+    rprint(f"[bold green]Starting Next.js dev server on http://localhost:{port}[/bold green]")
+    # Use exec-style spawn so Ctrl+C cleanly terminates the npm child.
+    subprocess.run([npm, "run", "dev"], cwd=frontend_dir, env=env, check=False)
+
+
+# Module-level singleton for the openapi-dump default. Required to avoid
+# Ruff B008 (typer.Option in defaults) while keeping the CLI ergonomic.
+_OPENAPI_DEFAULT_OUT: Path = Path("tmp/openapi.json")
+
+
+@app.command("openapi-dump")
+def openapi_dump(
+    out: Path = typer.Option(  # noqa: B008
+        _OPENAPI_DEFAULT_OUT,
+        "--out",
+        "-o",
+        help="Where to write the OpenAPI JSON.",
+    ),
+) -> None:
+    """Dump the OpenAPI schema to disk for offline TypeScript generation.
+
+    Used by `frontend/scripts/gen-types.mjs` when the backend isn't running.
+    """
+    spec = create_app().openapi()
+    out.parent.mkdir(parents=True, exist_ok=True)
+    out.write_text(json.dumps(spec, ensure_ascii=False, indent=2), encoding="utf-8")
+    rprint(f"[green]Wrote OpenAPI spec to {out} ({out.stat().st_size} bytes)[/green]")
+    rprint(
+        "Now in frontend/: [bold]npm run gen-types[/bold] to regenerate TypeScript types.",
     )
 
 
