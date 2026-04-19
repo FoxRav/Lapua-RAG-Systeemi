@@ -1,28 +1,37 @@
 """RAG answer service: *closed-book over Systeemi*.
 
-Two operating modes (``Settings.answer_mode``):
+Three operating modes (``Settings.answer_mode``):
 
 * ``synth`` — Qwen2.5-1.5B + LoRA ``lapua-llm-v2`` synthesises a JSON
   answer from the top reranked chunks. Closed-book: the model is only
   allowed to use the retrieved context, never its pretraining memory.
 * ``retrieve`` — skip the LLM entirely and return the top-N reranked
   chunks verbatim with citations. Use this when the synthesis model is
-  unreliable (e.g. an overtrained-abstain LoRA) and the user is better
-  served by reading the cited evidence directly. Same abstain
-  guarantees apply: ``no_context`` and ``below_threshold`` still
-  short-circuit before any results are returned.
+  unreliable and the user is better served by reading the cited
+  evidence directly.
+* ``extract`` — bridge mode (v0.6) for use while ``lapua-llm-v3`` is
+  in training. The LoRA performs only the narrow task of quoting the
+  most relevant 1-3 sentences from the retrieved context (a task that
+  empirically bypasses lapua-llm-v2's abstain bias because the prompt
+  never asks the model to *answer* — only to *cite verbatim*). Python
+  then renders one coherent answer from the quote. If the LLM still
+  refuses or returns an empty quote, a deterministic Python fallback
+  picks the highest-overlap sentence from the top chunk so the user
+  always gets one cited answer rather than a 5-chunk dump.
 
-The abstention decision in both modes is made deterministically in
-Python **before** the LLM call (synth) or **before** the chunks are
-returned (retrieve). This is a product guarantee, not a model hint.
+In all modes ``no_context`` and ``below_threshold`` short-circuit
+deterministically in Python **before** any LLM call. This is a product
+guarantee, not a model hint.
 """
 
 from __future__ import annotations
 
+import json
+import re
 from dataclasses import dataclass
 from typing import Literal
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, ValidationError
 
 from lapua_rag.extract.llm import LlmClient
 from lapua_rag.observability import get_logger
@@ -36,7 +45,7 @@ AbstainReason = Literal[
     "model_refused",
 ]
 
-AnswerMode = Literal["synth", "retrieve"]
+AnswerMode = Literal["synth", "retrieve", "extract"]
 
 
 class RagSource(BaseModel):
@@ -138,6 +147,196 @@ def _looks_like_abstain(answer: RagAnswer) -> bool:
     return any(pat in text for pat in _ABSTAIN_PATTERNS)
 
 
+# ---------------------------------------------------------------------------
+# Extract-mode helpers (v0.6 bridge while lapua-llm-v3 is in training).
+# ---------------------------------------------------------------------------
+
+
+class _ExtractResponse(BaseModel):
+    """Narrow LLM contract for ``extract`` mode.
+
+    The schema deliberately avoids the word "answer" or "vastaus" — the LoRA's
+    abstain bias is keyed to those tokens. We ask only for a verbatim quote
+    plus a 1-based index pointing back to the source chunk.
+    """
+
+    model_config = ConfigDict(frozen=True)
+
+    quote: str = Field(default="", max_length=600)
+    chunk_index: int = Field(default=1, ge=1)
+    no_match: bool = False
+
+
+_EXTRACT_SYSTEM = (
+    "Olet Lapuan kaupungin päätöstekstien tarkkuus-extraktori. "
+    "Saat numeroidut katkelmat (1, 2, 3, ...) ja kysymyksen. "
+    "Tehtäväsi: poimi katkelmista tasan ne 1–3 virkettä jotka sisältävät "
+    "kysymyksessä haetun tiedon. "
+    "Säännöt: "
+    "(1) Lainaa SANATARKASTI — älä muotoile uudelleen, älä lisää sanoja. "
+    "(2) Aseta 'chunk_index' siihen numeroon (1..N) josta lainasit. "
+    "(3) Jos katkelmissa EI OLE tietoa kysymykseen, aseta no_match=true ja "
+    "jätä quote tyhjäksi. Älä keksi vastausta. "
+    "Vastaa AINOASTAAN JSON-objektilla muodossa "
+    '{"quote": "...", "chunk_index": N, "no_match": false} '
+    "ilman selityksiä, koodilohkoja tai ympäröivää tekstiä."
+)
+
+
+# Match the first {...} block in the model's reply so we can recover even
+# when the LoRA wraps the JSON in markdown fences or prepends a few words.
+_JSON_OBJECT_RE = re.compile(r"\{.*?\}", re.DOTALL)
+
+
+def _parse_extract_response(text: str) -> _ExtractResponse | None:
+    """Lenient JSON parser for extract-mode plain-text responses.
+
+    The LoRA was trained on JSON and usually emits it cleanly, but small
+    quants sometimes wrap it in ``` fences or add a leading word. We accept
+    the first JSON object we can find; if validation fails we surrender to
+    the deterministic Python fallback rather than guess.
+    """
+    text = text.strip()
+    if not text:
+        return None
+    candidates: list[str] = [text]
+    match = _JSON_OBJECT_RE.search(text)
+    if match is not None and match.group(0) != text:
+        candidates.append(match.group(0))
+    for candidate in candidates:
+        try:
+            raw = json.loads(candidate)
+        except json.JSONDecodeError:
+            continue
+        try:
+            return _ExtractResponse.model_validate(raw)
+        except ValidationError:
+            continue
+    return None
+
+
+# Sentence-splitter regex tuned for OCR'd Finnish meeting minutes:
+# split after .!? when followed by whitespace and a capital letter or digit
+# (pages numbers, decision IDs). Keeps multi-sentence quoting intact.
+_SENTENCE_SPLIT = re.compile(r"(?<=[.!?])\s+(?=[A-ZÅÄÖ0-9])")
+_HTML_TAG = re.compile(r"<[^>]+>")
+_MD_HEADER = re.compile(r"^\s*#{1,6}\s+", flags=re.MULTILINE)
+_WHITESPACE = re.compile(r"\s+")
+_WORD = re.compile(r"\w+", flags=re.UNICODE)
+# Finnish stopwords kept tiny on purpose — we don't want to over-strip in
+# short queries. Goal: filter only the most empty connectors so token-overlap
+# scoring focuses on content nouns.
+_QUERY_STOPWORDS: frozenset[str] = frozenset(
+    {
+        "on", "ei", "ja", "tai", "se", "että", "joka", "mikä",
+        "kuka", "missä", "milloin", "miten", "mitä", "kuinka",
+        "kenen", "ovat", "ole", "tämä", "tuo", "voi",
+    }
+)
+
+
+def _split_sentences(text: str) -> list[str]:
+    """Split OCR'd Finnish prose into sentences, dropping markup noise.
+
+    Robust to HTML tables, markdown headers, and double newlines that the
+    PP-StructureV3 pipeline emits. We deliberately keep the implementation
+    naive — a heavier NLP splitter would be overkill for the
+    quote-fallback path and add a startup cost we don't want.
+    """
+    cleaned = _HTML_TAG.sub(" ", text)
+    cleaned = _MD_HEADER.sub("", cleaned)
+    cleaned = _WHITESPACE.sub(" ", cleaned).strip()
+    if not cleaned:
+        return []
+    parts = _SENTENCE_SPLIT.split(cleaned)
+    # Filter very short fragments — OCR list items (single names) score
+    # poorly anyway and add noise to the ranking.
+    return [p.strip() for p in parts if len(p.strip()) >= 20]
+
+
+def _query_tokens(query: str) -> set[str]:
+    return {
+        t for t in (m.group(0).lower() for m in _WORD.finditer(query))
+        if len(t) >= 4 and t not in _QUERY_STOPWORDS
+    }
+
+
+def _score_sentence(sentence: str, query_terms: set[str]) -> int:
+    if not query_terms:
+        return 0
+    tokens = {m.group(0).lower() for m in _WORD.finditer(sentence)}
+    return len(tokens & query_terms)
+
+
+def _python_fallback_quote(query: str, chunk_text: str, max_chars: int = 600) -> str:
+    """Pick the most query-relevant 1-2 sentences from ``chunk_text``.
+
+    Used when the LoRA returns ``no_match=true`` or an empty quote despite
+    the gate having allowed the chunk through. This guarantees the user
+    always gets one cited sentence, not a silent abstain in extract mode.
+    """
+    sentences = _split_sentences(chunk_text)
+    if not sentences:
+        return chunk_text[:max_chars].strip()
+    terms = _query_tokens(query)
+    # Sort by (-score, length) so the most overlap wins; on ties prefer the
+    # shorter, more focused sentence over a wall-of-text rebuttal.
+    ranked = sorted(
+        sentences,
+        key=lambda s: (-_score_sentence(s, terms), len(s)),
+    )
+    chosen: list[str] = []
+    total = 0
+    for sent in ranked[:2]:
+        budget = max_chars - total - (1 if chosen else 0)
+        if budget <= 20:
+            break
+        chosen.append(sent[:budget])
+        total += len(chosen[-1]) + 1
+    return " ".join(chosen)
+
+
+def _python_fallback_across_chunks(
+    query: str,
+    results: list[RetrievalResult],
+    *,
+    max_chars: int = 600,
+) -> tuple[int, str]:
+    """Find the highest-overlap sentence across *all* retrieved chunks.
+
+    v0.6.2: when the LoRA correctly says ``no_match`` it usually means the
+    reranker top-1 chunk does not actually answer the question (e.g. an
+    attendance list selected for a "kuka on" query). Falling back to the
+    top-1's text in that case surfaces noise. Searching across the entire
+    retrieved set lets the deterministic layer recover the right chunk
+    when it exists in the rerank pool.
+
+    Returns ``(1-based chunk index in results, quote)``. Always returns
+    something — if no sentence has any overlap we surface the top-1 chunk's
+    truncated text so the user still gets a cited reply.
+    """
+    if not results:
+        return 1, ""
+    terms = _query_tokens(query)
+    best_score = -1
+    best_idx = 0
+    best_sentence = ""
+    for idx, r in enumerate(results):
+        sentences = _split_sentences(r.text)
+        for sent in sentences:
+            score = _score_sentence(sent, terms)
+            if score > best_score:
+                best_score = score
+                best_idx = idx
+                best_sentence = sent
+    if best_score <= 0:
+        # No overlap anywhere — keep the existing top-1 behaviour for
+        # backward compatibility (better than empty answer).
+        return 1, _python_fallback_quote(query, results[0].text, max_chars=max_chars)
+    quote = best_sentence[:max_chars].strip()
+    return best_idx + 1, quote
+
+
 def _build_context(
     results: list[RetrievalResult],
     *,
@@ -158,6 +357,28 @@ def _build_context(
         header += "]"
         snippet = r.text if len(r.text) <= max_chars_per_chunk else r.text[:max_chars_per_chunk]
         blocks.append(f"{header}\n{snippet}")
+    return "\n\n---\n\n".join(blocks)
+
+
+def _build_numbered_context(
+    results: list[RetrievalResult],
+    *,
+    max_chunks: int,
+    max_chars_per_chunk: int,
+) -> str:
+    """Render context for extract mode with explicit 1-based chunk indices.
+
+    The model is asked to return the index it quoted from, so each block
+    must be prefixed with a stable, easily-tokenised number (the LoRA's
+    tokeniser splits ``[1]`` cleanly).
+    """
+    blocks: list[str] = []
+    for idx, r in enumerate(results[:max_chunks], start=1):
+        header_meta = f"{r.doc_id} | sivu {r.page_no}"
+        if r.section_id:
+            header_meta += f" | {r.section_id}"
+        snippet = r.text if len(r.text) <= max_chars_per_chunk else r.text[:max_chars_per_chunk]
+        blocks.append(f"[{idx}] ({header_meta})\n{snippet}")
     return "\n\n---\n\n".join(blocks)
 
 
@@ -204,6 +425,12 @@ class AnswerService:
     # Per-source snippet length when mode == "retrieve". Larger than the
     # synth-mode default (200) because the user reads the snippet directly.
     retrieve_snippet_chars: int = 600
+    # Tighter bounds for extract-mode prompts: the LoRA only needs to find a
+    # single quote, and v0.6.0 smoke tests showed that 5 * 1500 chars +
+    # outlines guided_json crashed vLLM's AsyncLLMEngine on 6 GB GPUs.
+    extract_max_chunks: int = 3
+    extract_max_chars_per_chunk: int = 800
+    extract_max_new_tokens: int = 256
 
     def answer(self, *, query: str, tenant: str) -> RagAnswer:
         results = self.search.search(query=query, tenant=tenant)
@@ -215,6 +442,13 @@ class AnswerService:
         top_score = max(r.score for r in results)
         if self.mode == "retrieve":
             return self._retrieve_answer(results=results, top_score=top_score, tenant=tenant)
+        if self.mode == "extract":
+            return self._extract_answer(
+                query=query,
+                results=results,
+                top_score=top_score,
+                tenant=tenant,
+            )
         return self._synth_answer(
             query=query,
             results=results,
@@ -301,6 +535,161 @@ class AnswerService:
             abstain_reason=None,
             max_source_score=top_score,
         )
+
+    # ------------------------------------------------------------------
+    # Extract mode: LoRA performs only a narrow quote-extraction task;
+    # Python renders the final answer template. Falls back to a
+    # deterministic sentence picker if the LoRA still refuses.
+    def _extract_answer(
+        self,
+        *,
+        query: str,
+        results: list[RetrievalResult],
+        top_score: float,
+        tenant: str,
+    ) -> RagAnswer:
+        n = min(len(results), self.extract_max_chunks)
+        context = _build_numbered_context(
+            results,
+            max_chunks=n,
+            max_chars_per_chunk=self.extract_max_chars_per_chunk,
+        )
+        prompt = (
+            f"Kysymys:\n{query}\n\n"
+            f"Numeroidut katkelmat Systeemistä:\n{context}\n\n"
+            "Palauta JSON jossa quote on sanatarkka lainaus (1–3 virkettä), "
+            "chunk_index on sen katkelman numero (1..N) josta lainasit, ja "
+            "no_match=true VAIN jos mikään katkelma ei sisällä vastausta."
+        )
+        _log.info(
+            "rag.extract_call",
+            tenant=tenant,
+            n_results=len(results),
+            n_context_chunks=n,
+            context_chars=len(context),
+            top_score=top_score,
+        )
+
+        used_index, quote, used_python_fallback = self._extract_quote(
+            query=query,
+            prompt=prompt,
+            results=results,
+            n_chunks=n,
+            tenant=tenant,
+        )
+
+        used = results[used_index - 1]
+        header = f"[{used.doc_id} | sivu {used.page_no}"
+        if used.section_id:
+            header += f" | {used.section_id}"
+        header += "]"
+        perustelut_source = (
+            "Python-fallback: lainattu suoraan korkeimman pisteen lähteestä "
+            if used_python_fallback
+            else "Lainattu suoraan lähteestä "
+        )
+        perustelut = f"{perustelut_source}{header} (reranker-score {used.score:.3f})."
+
+        # Lähteet: ensin lainauksen lähde, sitten muut top-N kontekstista
+        # tukimateriaaliksi (lyhennetyillä snipeteillä). Käyttäjä näkee mistä
+        # lainaus tulee mutta voi silti tarkistaa tukevat katkelmat.
+        sources = [
+            RagSource(
+                chunk_id=used.chunk_id,
+                doc_id=used.doc_id,
+                page_no=used.page_no,
+                section_id=used.section_id,
+                snippet=used.text[: self.retrieve_snippet_chars],
+            )
+        ]
+        for r in results[:n]:
+            if r.chunk_id == used.chunk_id:
+                continue
+            sources.append(
+                RagSource(
+                    chunk_id=r.chunk_id,
+                    doc_id=r.doc_id,
+                    page_no=r.page_no,
+                    section_id=r.section_id,
+                    snippet=r.text[: self.retrieve_snippet_chars],
+                )
+            )
+
+        return RagAnswer(
+            johtopaatos=quote,
+            perustelut=perustelut,
+            lahteet=sources,
+            abstained=False,
+            abstain_reason=None,
+            max_source_score=top_score,
+        )
+
+    def _extract_quote(
+        self,
+        *,
+        query: str,
+        prompt: str,
+        results: list[RetrievalResult],
+        n_chunks: int,
+        tenant: str,
+    ) -> tuple[int, str, bool]:
+        """Run the LoRA extract call and apply the Python fallback.
+
+        Returns ``(used_chunk_index, quote, used_python_fallback)``. The
+        index is 1-based and clamped into ``[1, n_chunks]`` so downstream
+        code can index ``results`` safely even when the LLM returns junk.
+
+        v0.6.1: switched from ``generate_json`` (outlines guided_json) to
+        ``generate_text`` + lenient JSON parser. The schema only has three
+        fields, so guided decoding's overhead was killing the small GPU
+        without buying us reliability we can't recover from in Python.
+        """
+        try:
+            text = self.llm.generate_text(
+                system=_EXTRACT_SYSTEM,
+                prompt=prompt,
+                max_new_tokens=256,
+            )
+        except Exception as exc:
+            # Narrow except is hard here: httpx errors, retries exhausted,
+            # connection refused. Logged structurally and a Python fallback
+            # ensures the user still gets a coherent cited answer rather
+            # than a raw error.
+            _log.warning(
+                "rag.extract_llm_failed",
+                tenant=tenant,
+                error_type=type(exc).__name__,
+                error=str(exc)[:200],
+            )
+            chunk_idx, quote = _python_fallback_across_chunks(query, results)
+            return chunk_idx, quote, True
+
+        parsed = _parse_extract_response(text)
+        if parsed is None:
+            _log.info(
+                "rag.extract_python_fallback",
+                tenant=tenant,
+                reason="parse_failed",
+                raw_preview=text[:120],
+            )
+            chunk_idx, quote = _python_fallback_across_chunks(query, results)
+            return chunk_idx, quote, True
+
+        if parsed.no_match or not parsed.quote.strip():
+            chunk_idx, quote = _python_fallback_across_chunks(query, results)
+            _log.info(
+                "rag.extract_python_fallback",
+                tenant=tenant,
+                reason="no_match" if parsed.no_match else "empty_quote",
+                chosen_chunk_idx=chunk_idx,
+            )
+            return chunk_idx, quote, True
+
+        # Clamp the model-supplied index to the range we actually rendered;
+        # the LoRA occasionally emits 0 or an out-of-range integer despite
+        # the schema's ge=1 constraint when temperature noise sneaks past.
+        idx = max(1, min(parsed.chunk_index, n_chunks))
+        return idx, parsed.quote.strip(), False
 
     # ------------------------------------------------------------------
     # Synth mode: build prompt, call LLM, validate, recover abstain semantics.

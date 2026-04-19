@@ -72,10 +72,19 @@ class Settings(BaseSettings):
     #             model is unreliable (e.g. lapua-llm-v2 is overtrained
     #             to abstain — see README §11) and we prefer surfacing
     #             evidence to the user instead of hallucinated answers.
-    answer_mode: Literal["synth", "retrieve"] = "synth"
+    # "extract" = retrieve → rerank → LoRA quotes 1-3 verbatim sentences,
+    #             Python renders the final coherent answer. Bridge mode
+    #             (v0.6) for use while lapua-llm-v3 retraining is in flight.
+    #             Falls back to a deterministic sentence picker when the
+    #             LoRA still refuses, so the user always gets one cited
+    #             answer instead of a 5-chunk dump.
+    answer_mode: Literal["synth", "retrieve", "extract"] = "extract"
     # BGE reranker-v2-m3 score below which we abstain without calling the LLM.
-    # Typical relevant ~0..+5, irrelevant negative; 0.0 keeps the gate open.
-    answer_min_score: float = 0.0
+    # The model emits sigmoid scores: ~0.5+ relevant, <0.05 typically irrelevant.
+    # 0.10 (v0.6.2) abstains cleanly on aggregation/out-of-corpus questions
+    # (e.g. "Kuinka monessa päätöksessä X on mukana?" returned top_score 0.030
+    # in the v0.6.1 smoke test) without rejecting legitimate matches.
+    answer_min_score: float = 0.10
     # Number of reranked chunks fed into the LLM context. Must match or be
     # below SearchService.top_k_final (5) so we don't silently drop top results.
     answer_max_context_chunks: int = 5

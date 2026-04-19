@@ -4,7 +4,7 @@ import { useQuery } from "@tanstack/react-query";
 import { Activity, FileStack, GitCommitVertical, Loader2 } from "lucide-react";
 import { api, type AnswerMode } from "@/lib/api/client";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
-import { Switch } from "@/components/ui/switch";
+import { Tabs, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import { Label } from "@/components/ui/label";
 import { Separator } from "@/components/ui/separator";
 import { Badge } from "@/components/ui/badge";
@@ -12,6 +12,15 @@ import { Badge } from "@/components/ui/badge";
 type Props = {
   mode: AnswerMode;
   onModeChange: (mode: AnswerMode) => void;
+};
+
+// Description and short label kept here so the SystemSidebar UI is the
+// single source of truth for what each mode does — no scattered copies.
+const MODE_DESCRIPTIONS: Record<AnswerMode, string> = {
+  extract:
+    "Extract: LoRA lainaa relevantin virkkeen, Python rakentaa yhden vastauksen (silta v3:lle).",
+  retrieve: "Retrieve: top-N lähteet sellaisinaan, ei LLM-syntheesiä.",
+  synth: "Synthesis: LLM tiivistää vastauksen lähteistä (vaatii toimivan LoRAn).",
 };
 
 type StatsResponse = {
@@ -59,22 +68,26 @@ export function SystemSidebar({ mode, onModeChange }: Props): React.ReactNode {
           </CardTitle>
         </CardHeader>
         <CardContent className="space-y-3">
-          <div className="flex items-center justify-between gap-3">
-            <div className="space-y-0.5">
-              <Label htmlFor="mode-toggle" className="text-sm font-normal">
-                Vastaustapa
-              </Label>
-              <div className="text-xs text-muted-foreground">
-                {mode === "synth"
-                  ? "Synthesis: LLM tiivistää lähteistä"
-                  : "Retrieve: top-N lähteet sellaisinaan"}
-              </div>
+          <div className="space-y-2">
+            <Label className="text-sm font-normal">Vastaustapa</Label>
+            <Tabs
+              value={mode}
+              onValueChange={(value) => {
+                // Base UI Tabs returns `string | number`; we know our values.
+                if (value === "extract" || value === "retrieve" || value === "synth") {
+                  onModeChange(value);
+                }
+              }}
+            >
+              <TabsList className="grid grid-cols-3 w-full">
+                <TabsTrigger value="extract">Extract</TabsTrigger>
+                <TabsTrigger value="retrieve">Retrieve</TabsTrigger>
+                <TabsTrigger value="synth">Synth</TabsTrigger>
+              </TabsList>
+            </Tabs>
+            <div className="text-xs text-muted-foreground leading-relaxed">
+              {MODE_DESCRIPTIONS[mode]}
             </div>
-            <Switch
-              id="mode-toggle"
-              checked={mode === "synth"}
-              onCheckedChange={(v) => onModeChange(v ? "synth" : "retrieve")}
-            />
           </div>
         </CardContent>
       </Card>

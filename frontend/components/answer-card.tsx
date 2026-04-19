@@ -63,7 +63,12 @@ export function AnswerCard({ answer, mode, query }: Props): React.ReactNode {
             Kysymys: <span className="text-foreground font-medium">{query}</span>
           </CardTitle>
           <div className="flex items-center gap-2">
-            <Badge variant={mode === "synth" ? "default" : "secondary"} className="uppercase">
+            <Badge
+              // extract + synth produce a single coherent answer → emphasised badge.
+              // retrieve dumps top-N chunks verbatim → muted badge to signal that.
+              variant={mode === "retrieve" ? "secondary" : "default"}
+              className="uppercase"
+            >
               {mode}
             </Badge>
             <ScoreMeter score={answer.max_source_score} />

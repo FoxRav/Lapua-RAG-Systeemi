@@ -36,6 +36,21 @@ class LlmClient(Protocol):
     ) -> dict[str, object]:
         ...
 
+    def generate_text(
+        self,
+        *,
+        system: str,
+        prompt: str,
+        max_new_tokens: int | None = None,
+    ) -> str:
+        """Plain-text completion without guided/grammar decoding.
+
+        Used by extract-mode where the JSON schema is so simple (3 fields)
+        that outlines/grammar enforcement is not worth the engine cost.
+        Callers parse the returned string leniently.
+        """
+        ...
+
 
 @dataclass(slots=True)
 class LocalLlmClient:
@@ -136,6 +151,40 @@ class LocalLlmClient:
         text = self._tokenizer.decode(generated, skip_special_tokens=True)  # type: ignore[attr-defined]
         return json.loads(text)
 
+    def generate_text(
+        self,
+        *,
+        system: str,
+        prompt: str,
+        max_new_tokens: int | None = None,
+    ) -> str:
+        self._ensure_loaded()
+        assert self._model is not None
+        assert self._tokenizer is not None
+
+        messages = [
+            {"role": "system", "content": system},
+            {"role": "user", "content": prompt},
+        ]
+        encoded = self._tokenizer.apply_chat_template(  # type: ignore[attr-defined]
+            messages,
+            add_generation_prompt=True,
+            return_tensors="pt",
+            return_dict=True,
+        )
+        input_ids = encoded["input_ids"]
+        attention_mask = encoded["attention_mask"]
+        output = self._model.generate(  # type: ignore[attr-defined]
+            input_ids,
+            attention_mask=attention_mask,
+            max_new_tokens=max_new_tokens or self.max_new_tokens,
+            do_sample=False,
+            pad_token_id=self._tokenizer.pad_token_id,  # type: ignore[attr-defined]
+        )
+        generated = output[0][input_ids.shape[-1] :]
+        text: str = self._tokenizer.decode(generated, skip_special_tokens=True)  # type: ignore[attr-defined]
+        return text
+
 
 @dataclass(slots=True)
 class RemoteVllmClient:
@@ -170,6 +219,33 @@ class RemoteVllmClient:
             data = response.json()
         content = data["choices"][0]["message"]["content"]
         return json.loads(content)
+
+    @retry(stop=stop_after_attempt(3), wait=wait_exponential(min=1, max=10))
+    def generate_text(
+        self,
+        *,
+        system: str,
+        prompt: str,
+        max_new_tokens: int | None = None,
+    ) -> str:
+        # Plain-text path: no guided_json, so vLLM does not load the outlines
+        # FSM. On the small RTX 4050 (6 GB) this avoids the AsyncLLMEngine
+        # iteration timeout that killed the engine in v0.6.0 smoke tests.
+        payload = {
+            "model": self.model,
+            "messages": [
+                {"role": "system", "content": system},
+                {"role": "user", "content": prompt},
+            ],
+            "max_tokens": max_new_tokens or self.max_new_tokens,
+            "temperature": 0.0,
+        }
+        with httpx.Client(timeout=self.timeout) as client:
+            response = client.post(f"{self.base_url}/chat/completions", json=payload)
+            response.raise_for_status()
+            data = response.json()
+        content: str = data["choices"][0]["message"]["content"]
+        return content
 
 
 def default_client() -> LlmClient:

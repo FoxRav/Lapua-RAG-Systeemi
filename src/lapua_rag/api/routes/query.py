@@ -37,11 +37,12 @@ def query(request: QueryRequest) -> RagAnswer:
     return svc.answer(query=request.query, tenant=request.tenant or settings.tenant)
 
 
-@lru_cache(maxsize=2)
+@lru_cache(maxsize=3)
 def _answer_service(mode: AnswerMode) -> AnswerService:
     """Build an AnswerService for a given mode. Cached separately per mode
     so we share the heavy embedder/reranker instances across requests but
     still respect per-request mode overrides without rebuilding everything.
+    Cache size = 3 to cover synth/retrieve/extract.
     """
     settings = get_settings()
     embedder = Embedder(

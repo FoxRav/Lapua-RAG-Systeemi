@@ -84,6 +84,102 @@ omalla Systeemillä + LoRA-adapterilla per asiakas.
   "En löydä Systeemistä vastausta" kysymyksille joihin kontekstin
   max_source_score < kynnys.
 
+### v0.6.2 · 2026-04-18 – Reranker-boost + cross-chunk fallback + tiukempi gate
+
+Vahvistus: live smoke-testi paljasti että v0.6:n `extract`-tila *toimii*
+(LoRA tuottaa quoteja eikä abstainaa kapeassa tehtävässä), mutta kolme
+erillistä vikaa ohjasi vastauksen pieleen. Kaikki kolme on nyt korjattu.
+
+| # | Ongelma v0.6.0:ssa | Korjaus v0.6.2:ssa |
+|---|--------------------|---------------------|
+| 1 | "Saapuvillaolleet jäsenet"-chunkit voittivat reranker-pisteissä (~0.99) myös spesifeihin "kuka on" -kysymyksiin | `_chunk_type_boost`: +0.20 chunkeille joissa `## Päätös` + valinta-verbi; -0.15 osallistujalistoille |
+| 2 | Reranker top-k_final=5 → oikea chunk saattoi jäädä pooliin pääsemättä | `top_k_final = 8` (riittävä headroom myös laajemmalle korpukselle) |
+| 3 | Python-fallback käytti aina top-1 chunkkia → kun reranker oli väärässä, fallback toisti virheen | `_python_fallback_across_chunks`: hakee parhaan token-overlap-virkkeen *kaikista* top-N chunkista |
+| 4 | `min_score=0.0` salli aggregointi-/skooppitappio-kysymysten edetä LLM:lle (Q3 top-score 0.030 antoi "Sami Kuula." -tason vastauksen) | `answer_min_score = 0.10` (BGE-sigmoid: relevant >0.5, marginal 0.10-0.50, irrelevant <0.05) |
+
+**Smoke-testi v0.6.2:lla** (samat 3 kysymystä jotka aiemmin tuottivat
+ohilaukauksia):
+
+| Kysymys | top_score | abstained | Tulos |
+|---------|-----------|-----------|-------|
+| "Kuka on Lapuan kaupunginhallituksen puheenjohtaja?" | 1.189 (boost) | False | LoRA suoralla sitaatilla "Lapuan kaupunginhallituksen puheenjohtaja Kai Pöntinen" |
+| "Kuka on Lapuan kaupunginjohtaja?" | 1.144 (boost) | False | Cross-chunk Python-fallback löysi "Satu Kankare … Kaupunginjohtaja" oikealta sivulta |
+| "Kuinka monessa päätöksessä Sami Kuula on ollut mukana?" | 0.030 | **True** | Siisti abstention: "Parhaan vastaavuuden pisteet (0.030) jäivät kynnyksen (0.100) alle" |
+
+**13 uutta yksikkötestiä** kattaa boost-funktion (5), end-to-end-flippauksen
+stub-rerankerilla (2), cross-chunk-fallbackin kahdessa tilassa (2), lenient
+JSON-parserin (2), markdown-fence-toipumisen (1) ja garbage-syötteen (1).
+**Yhteensä 69 testiä vihreinä**, ruff puhdas.
+
+### v0.6.1 · 2026-04-18 – vLLM-stabiliteetti + plain-text + lenient JSON
+
+Live smoke-testi v0.6.0:lla paljasti että **vLLM AsyncLLMEngine kuoli
+60 s -timeoutiin** ensimmäiseen heavy-promptiin: 5169-merkin konteksti +
+outlines `guided_json` RTX 4050 Laptopilla (6 GB) ylitti
+`ENGINE_ITERATION_TIMEOUT_S`-rajan, ja kuoltuaan engine ei toipunut →
+kaikki seuraavat kutsut 500 / ConnectError. Korjaukset:
+
+- **`generate_text`** rinnakkainen polku `LlmClient`-protokollaan: plain
+  chat completion ilman `guided_json`:ia. Käytetään extract-tilassa, jossa
+  skeema on niin pieni (3 kenttää) että outlines-overhead ei ole
+  perusteltu. Lenient JSON-parseri (`_parse_extract_response`) toipuu
+  myös markdown-koodiaitojen sisään käärityistä vastauksista, joita
+  lapua-llm-v2 empiirisesti emittoi.
+- **Kevyempi extract-promptin context**: `extract_max_chunks=3`
+  (vs. 5) × `extract_max_chars_per_chunk=800` (vs. 1500). Konteksti
+  tippui 5169 → ~2400 merkkiä (≥50 % vähennys). Synth-tila käyttää
+  edelleen 5×1500 vakiokokoa.
+- **vLLM-startup-skriptin kovetus**: `VLLM_ENGINE_ITERATION_TIMEOUT_S=180`,
+  `--max-num-seqs 1` (single-user laptop), `--enforce-eager`.
+
+### v0.6 · 2026-04-18 – `extract`-tila: yksi yhtenäinen vastaus ilman v3:a
+
+Käyttäjäpalaute v0.5:n `retrieve`-tilasta: *"vastaukset eivät ole järkeviä,
+tarvitaan yksi yhtenäinen vastaus eikä järjetöntä määrää ohilaukauksia"*.
+`retrieve`-tila on suunniteltu chunk-dumpiksi (käyttäjä lukee evidenssin
+itse) ja `synth`-tila on rikki kunnes `lapua-llm-v3` on koulutettu (ks. §11).
+Tarvittiin kolmas tila joka antaa yhden siteeratun vastauksen heti.
+
+- **Uusi `extract`-vastaustila** (oletus v0.6:sta lähtien):
+  - **Stage A – LoRA-extract**: sama `lapua-llm-v2`, mutta kapealla
+    quote-only-tehtävällä (`_ExtractResponse {quote, chunk_index, no_match}`).
+    Kapeampi tehtävä ohittaa abstain-bias:n koska prompt ei pyydä mallia
+    *vastaamaan* — vain *lainaamaan sanatarkasti*.
+  - **Stage B – Python-render**: rakentaa `RagAnswer`:n templateksi:
+    johtopäätös = suora lainaus, perustelut = lähde-header + reranker-score,
+    lähteet = lainattu lähde ensin + tukevat lähteet seuraavina.
+  - **Python-fallback**: jos LoRA palauttaa `no_match=true`, tyhjän quote:n,
+    tai epäonnistuu (httpx/JSON/pydantic), heuristiikka valitsee top-1
+    chunkista virkkeen jolla on suurin token-overlap kysymyksen sisältö-
+    sanojen kanssa. Käyttäjä saa **aina** yhden siteeratun vastauksen.
+  - Suomi-tietoinen virkkeenjako (`_split_sentences`) joka strippaa
+    HTML-taulukot ja markdown-headerit OCR:n tuottamasta tekstistä.
+- **Closed-book-takuut säilyvät**: `no_context` ja `below_threshold` -portit
+  laukeavat ennen LLM-kutsua myös `extract`-tilassa. Hallusinaatioriski = 0
+  koska Stage B ei koskaan keksi sanoja kontekstin ulkopuolelta.
+- **Backend-laajennukset**:
+  - `AnswerMode` Literal: `"synth" | "retrieve" | "extract"`.
+  - `Settings.answer_mode` default `"extract"`.
+  - `_answer_service` `lru_cache(maxsize=3)` kattaa kaikki kolme tilaa.
+- **Frontend-laajennukset**:
+  - `SystemSidebar`: Switch korvattu 3-tilan `Tabs`:lla, näyttää
+    moodikohtaisen kuvauksen.
+  - `app/page.tsx`: `DEFAULT_MODE = "extract"`, LocalStorage tunnistaa
+    kaikki kolme arvoa.
+  - `AnswerCard`: badge-tyylit (`extract`+`synth` highlighted, `retrieve`
+    secondary) viestii että ekstraktio on aktiivinen synthesointi-luokka.
+- **10 uutta yksikkötestiä** (`test_extract_mode.py`): LoRA-quote happy path,
+  Python-fallback `no_match`/empty/exception-poluilla, chunk_index-clampaus,
+  no_context/below_threshold-portit, virkkeenjakajan robustius
+  HTML/markdown-noiselle. **Yhteensä 56 testiä vihreinä**, `answer.py`
+  coverage 98%. Ruff puhdas, `next build` + `tsc --noEmit` + ESLint OK.
+
+Vaikutus käyttäjän näkemään: aiempi 5-chunkin dump muuttuu yhdeksi
+selkeäksi *"Tarkastuslautakunta on kutsunut kaupunginjohtaja Satu Kankareen
+kertomaan kaupungin ajankohtaisista asioista."*-tyyppiseksi vastaukseksi
+joka linkittyy oikeaan PDF:ään ja säilyttää tukimateriaalit alapuolella
+tarkistettavaksi.
+
 ### v0.5 · 2026-04-18 – Systeemi-frontend (Next.js + shadcn/ui)
 
 Tähän asti Systeemiä on ajettu CLI:stä ja FastAPI:n raakana
@@ -111,7 +207,8 @@ tutkimisesta. v0.5:ssä saatiin täysi web-UI tuotantolaadulla:
   - `pdf-viewer.tsx` — Dialog-modaali, iframe selaimen sisäänrakennettuun
     PDF-katsojaan `#page=N&zoom=page-fit`-ankkurilla.
   - `system-sidebar.tsx` — korpus-stats, kattavuus per doc_type, versio,
-    **mode-toggle** (synth ↔ retrieve, persistoidaan LocalStorage:iin).
+    **mode-toggle** (v0.5: synth ↔ retrieve Switch; v0.6: extract / retrieve /
+    synth Tabs, persistoidaan LocalStorage:iin).
   - `query-history.tsx` — viimeiset 20 kyselyä LocalStorage:sta, klikkaa
     → injektoi inputtiin.
   - `theme-toggle.tsx` — light / dark / system, `next-themes` SSR-safe.
@@ -348,7 +445,7 @@ Tärkeimmät:
 | `LAPUA_LLM_VLLM_URL`             | tyhjä                                | Aseta → transparent remote vLLM  |
 | `LAPUA_LLM_VLLM_MODEL`           | `lapua-v2`                           | LoRA-moduulin nimi (vastaa `--lora-modules <nimi>=<path>`) |
 | `LAPUA_OCR_DEVICE`               | `gpu:0`                              | Paddle-laitevalinta              |
-| `LAPUA_ANSWER_MODE`              | `synth`                              | `synth`=LLM-synteesi, `retrieve`=top-N siteeratut katkelmat (suositus kunnes lapua-llm-v3 valmis) |
+| `LAPUA_ANSWER_MODE`              | `extract`                            | `extract`=LoRA-quote + Python-render (oletus, v0.6 silta), `retrieve`=top-N siteeratut katkelmat, `synth`=LLM-syntheesi (vaatii toimivan LoRAn, vrt. §11) |
 | `LAPUA_ANSWER_MIN_SCORE`         | `0.0`                                | Rerank-kynnys closed-book-guardille |
 | `LAPUA_ANSWER_MAX_CONTEXT_CHUNKS`| `5`                                  | LLM:lle/käyttäjälle näkyvien chunkien määrä |
 | `LAPUA_ANSWER_MAX_CHARS_PER_CHUNK`| `1500`                              | Per-chunk merkkibudjetti synth-modessa |
@@ -794,17 +891,61 @@ Koulutusdata oli ilmeisesti voimakkaasti vinoutunut kieltäytymisesimerkkeihin.
 5. **Deploy**: julkaise `CCG-FAKTUM/lapua-llm-v3`, päivitä
    `LAPUA_LLM_LORA=CCG-FAKTUM/lapua-llm-v3` ja vaihda `LAPUA_ANSWER_MODE=synth`.
 
-### Sillaikaa
+### Sillaikaa: `extract`-tila (v0.6 silta)
 
-`LAPUA_ANSWER_MODE=retrieve` (tämän commitin default `.env`:ssä) tuottaa
-luotettavasti relevantteja vastauksia — käyttäjä lukee top-N siteeratut
-katkelmat suoraan. Closed-book-guarantee säilyy, hallusinaatioriski = 0,
-relevanttiusarvio reranker-scoreissa näkyvissä.
+Käyttäjäpalaute v0.5:n `retrieve`-tilasta: *"vastaukset eivät ole järkeviä,
+tarvitaan yksi yhtenäinen vastaus eikä järjetöntä määrää ohilaukauksia"*.
+Vastaus tähän on **kolmas vastaustila** `extract` (default `.env.example`:ssa
+v0.6:sta lähtien), joka antaa yhden siteeratun vastauksen ilman v3-koulutuksen
+odottelua.
+
+**Toimintaperiaate**:
+
+1. **Stage A – LoRA-extract**: Sama `lapua-llm-v2` LoRA, mutta kapealla
+   tehtävällä: *"lainaa kontekstista 1–3 virkettä jotka sisältävät vastauksen,
+   palauta `chunk_index` ja `no_match`"*. Kapeampi tehtävä ohittaa abstain-bias:n
+   koska prompt ei pyydä mallia *vastaamaan* — vain *lainaamaan sanatarkasti*.
+2. **Stage B – Python-render**: Vastaus rakennetaan templateksi: johtopäätös =
+   suora lainaus, perustelut = lähde-header + reranker-score, lähteet = lainattu
+   lähde ensin + tukevat lähteet seuraavina.
+3. **Fallback**: Jos LoRA palauttaa `no_match=true`, tyhjän quote:n, tai
+   epäonnistuu (httpx/JSON/pydantic), Python-heuristiikka valitsee top-1
+   chunkista virkkeen jolla on suurin token-overlap kysymyksen sisältösanojen
+   kanssa. Käyttäjä saa aina yhden siteeratun vastauksen — ei koskaan dump:ia.
+
+**Mitä `extract` EI ratkaise**:
+
+- **Reranker-virheet** (osittain korjattu v0.6.2:ssa): Jos top-1 chunk on
+  väärä, extract lainaa väärästä lähteestä yhtä varmasti kuin synth
+  syntetisoisi väärin. v0.6.2:n `_chunk_type_boost` (`## Päätös`+verbi
+  +0.20, osallistujalistat -0.15) ratkaisi smoke-testin Q1/Q2-virheet,
+  mutta yleisempi reranker-laajennus (query-rewrite, MMR-diversifikaatio,
+  isompi rerank-pool 8 → 20) jää roadmapille §11.4.
+- **Aggregointikysymykset**: *"Kuinka monessa päätöksessä Sami Kuula on
+  ollut mukana?"* on COUNT-kysymys joka ei kuulu RAG:iin lainkaan. v0.6.2:n
+  `answer_min_score=0.10` abstainaa nämä siististi sen sijaan että ne
+  tuottaisivat järjettömiä vastauksia, mutta lopullinen ratkaisu on
+  oma SQL-pohjainen `/v1/aggregate`-endpoint (ks. roadmap §11.5).
+
+**Konfigurointi**: `LAPUA_ANSWER_MODE=extract` (default), tai per-pyyntö
+`POST /v1/query {"query":"...", "mode":"extract"}`. UI:ssa 3-tilan
+välilehtivalinta `Extract / Retrieve / Synth` `SystemSidebar`:ssä.
 
 ### Aikataulu
 
 1–2 päivää: datan revisio + LoRA-koulutus (RTX 4050, 1.5B base, r=16, ~2 h
 per epoch × 3-5 epochia), validointi, julkaisu.
+
+### 11.4 Roadmap-tikettien jatkot
+
+- **Reranker-parannus** (Q1-tyyppisille hallitus/valtuusto-sekoituksille):
+  rerank-input top-K 5 → 20, query-rewrite step joka tuottaa 3 reformulointia,
+  max-pool-pisteytys.
+- **Aggregointi-endpoint** (Q3-tyyppisille COUNT-kysymyksille):
+  `POST /v1/aggregate` joka käyttää LoRA:a vain entity-extractioniin
+  (henkilö/päätös/päivämäärä) ja suorittaa SQL-haun
+  `decisions`-taulusta. UI tunnistaa "kuinka monta/montako" -kysymykset
+  ja reitittää ne automaattisesti.
 
 ---
 

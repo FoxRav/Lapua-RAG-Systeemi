@@ -9,17 +9,20 @@ import { SystemSidebar } from "@/components/system-sidebar";
 import { QueryHistory } from "@/components/query-history";
 
 const MODE_STORAGE_KEY = "lapua-rag.answer-mode.v1";
+// Default to extract for new sessions: it's the v0.6 bridge that gives one
+// coherent cited answer even while lapua-llm-v2 over-abstains in synth mode.
+const DEFAULT_MODE: AnswerMode = "extract";
 
 function readPersistedMode(): AnswerMode {
-  if (typeof window === "undefined") return "retrieve";
+  if (typeof window === "undefined") return DEFAULT_MODE;
   const v = window.localStorage.getItem(MODE_STORAGE_KEY);
-  return v === "synth" || v === "retrieve" ? v : "retrieve";
+  return v === "synth" || v === "retrieve" || v === "extract" ? v : DEFAULT_MODE;
 }
 
 export default function HomePage(): React.ReactNode {
   // Hydration-safe: initial render uses the SSR default, then we rehydrate
   // from LocalStorage in an effect to avoid mismatched markup.
-  const [mode, setMode] = useState<AnswerMode>("retrieve");
+  const [mode, setMode] = useState<AnswerMode>(DEFAULT_MODE);
   const [history, setHistory] = useState<HistoryEntry[]>([]);
   const [preset, setPreset] = useState<string | null>(null);
 

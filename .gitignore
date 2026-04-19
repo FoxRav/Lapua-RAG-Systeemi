@@ -27,6 +27,9 @@ tmp/*.out
 tmp/*.sh
 tmp/*.json
 tmp/*.py
+tmp/*.err
+tmp/*.pid
+tmp/*.txt
 tmp/downloads/
 # Whitelist long-lived planning notes / op runbooks if/when needed:
 # !tmp/rag_system_design.md
