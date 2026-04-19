@@ -23,51 +23,62 @@ omalla Systeemillä + LoRA-adapterilla per asiakas.
 
 ---
 
-## 1. Tilanneraportti (v0.2 · 2026-04-17)
+## 1. Tilanneraportti (v0.6.2 · 2026-04-19)
 
-### Valmista
+Repo julkaistu GitHubiin: <https://github.com/FoxRav/Lapua-RAG-Systeemi>.
 
-- **PaddleOCR-ympäristö pystyssä** (ks. §6). PP-StructureV3 ajettu onnistuneesti
-  45-sivuiselle *Talouden toteutumaraportti 31.3.25* -osavuosikatsaukselle,
-  keskimääräinen OCR-luottamus > 0.9, GPU NVIDIA RTX 4050 Laptop.
-- **Lapua-RAG skeleton-koodi kirjoitettu** – 18 moduulia, ~1400 riviä Python 3.10.
-  Kaikki rajapinnat paikallaan, toteutus kevyt muttei placeholderia.
+### Valmista (end-to-end ajossa)
+
+- **PaddleOCR-ympäristö pystyssä** (ks. §6). PP-StructureV3 ajettu eräajona
+  108 PDF:lle (DATA_päättävät_elimet_20251202), keskimääräinen OCR-luottamus
+  > 0.9, GPU NVIDIA RTX 4050 Laptop.
+- **Korpus indeksoitu**: **109 dokumenttia, 7 922 chunkia, 1.13 M tokenia**
+  Qdrantissa + SQLite FTS5:ssa (`scripts/batch_ingest.py`, 11 h 15 min
+  OCR+embed). Pipeline (`src/lapua_rag/pipeline.py`) ajettu kokonaisuutena.
+- **Hybridihaku tuotantokäytössä**: Qdrant dense + BM25 sparse + RRF-fuusio
+  + BGE reranker-v2-m3 cross-encoder, top_k_final=8 + chunk-type boost
+  (+0.20 `## Päätös`+verbi, -0.15 osallistujalistat).
+- **vLLM WSL2-distrossa live** (`lapua-vllm` / F:\wsl\lapua-vllm, Ubuntu 22.04).
+  Qwen2.5-1.5B bf16 + LoRA `lapua-llm-v2` rinnakkain `--lora-modules
+  lapua-v2=…`, OpenAI-endpoint `http://localhost:8000/v1`. Ks. §10.
+- **Vastaustila `extract` default** (v0.6 silta, v0.6.2 viritetty): LoRA
+  lainaa 1–3 virkettä → Python renderöi yhden siteeratun vastauksen.
+  Cross-chunk fallback ja `answer_min_score=0.10` siisti abstain
+  COUNT/off-topic-kysymyksille. Ks. §11.
+- **Closed-book-vahtikoira `AnswerService`:ssa**: LLM:ää ei kutsuta jos
+  Systeemistä ei löydy riittävän luotettavaa kontekstia. `RagAnswer`
+  kantaa `abstained` + `abstain_reason` (`no_context` / `below_threshold`
+  / `model_refused`) – hallusinaatioriski = 0 by construction.
 - **Systeemi-alijärjestelmä (`src/lapua_rag/systeemi/`)**: tilastot, versionti
   (deterministinen SHA-256 indeksoitujen dokumenttien yli), kattavuusraportti.
   API-endpointit `/v1/system/stats|version|coverage` ja CLI-aliryhmä
-  `lapua-rag system {stats,version,coverage}` – tyhjällä DB:llä smoke-testattu.
-- **Closed-book-vahtikoira `AnswerService`:ssa**: LLM:ää ei edes kutsuta jos
-  Systeemistä ei löydy riittävän luotettavaa kontekstia. `RagAnswer`
-  kantaa `abstained` + `abstain_reason` -kenttiä – hallusinaatiota ei voi
-  sattua huolimattomuudesta.
-- **34 yksikkötestiä vihreinä** (mojibake-korjaus, pykäläpohjainen chunkkaus,
-  doctype-heuristiikka, SHA-256-dedup, RRF-fuusio, suomen stemmer,
-  storage-layout, OCR-fallback-sääntö, Systeemin tilastot & versiointi,
-  closed-book-guard). `ruff` puhdas, `pytest` 2.7 s.
-- **Asennetut komponentit**: `peft`, `sentence-transformers`, `qdrant-client`,
-  `sqlmodel`, `structlog`, `watchdog`, `lm-format-enforcer`, `snowballstemmer`,
-  `rank-bm25`, `typer[all]` + dev-pakki (`ruff`, `mypy`, `pytest(-asyncio,-cov)`,
-  `black`, `isort`).
-- **`lapua-rag`-CLI asennettu editable-tilassa**, toimii:
-  `init / ingest / ingest-dir / query / serve / system {stats,version,coverage}`.
+  `lapua-rag system {stats,version,coverage}` ajettu live-korpuksella.
+- **Frontend tuotantolaadulla** (`frontend/`, ks. §12): Next.js 16 +
+  React 19 + Tailwind 4 + shadcn/ui (base-nova). Chat-paneeli, lähdekortit,
+  PDF-katsoja, 3-tilan moodikytkin (`extract / retrieve / synth`),
+  kyselyhistoria, light/dark/system theme. Tyypit autogeneroitu
+  FastAPI:n OpenAPI-spekistä.
+- **69 yksikkötestiä vihreinä, ~7 s** (mojibake-korjaus, pykäläpohjainen
+  chunkkaus, doctype-heuristiikka, SHA-256-dedup, RRF-fuusio, suomen
+  stemmer, storage-layout, OCR-fallback, Systeemin tilastot & versiointi,
+  closed-book-guard, retrieve/extract-tilojen flow, chunk-type boost,
+  cross-chunk fallback, lenient JSON-parser, PDF-streaming, mode-override).
+  `ruff` puhdas, `next build` + `tsc --noEmit` + ESLint OK.
+- **`lapua-rag`-CLI asennettu editable-tilassa**: `init / ingest / ingest-dir /
+  query / serve / ui / openapi-dump / system {stats,version,coverage}`.
 - **Deploy-konfigurointi** (`deploy/docker-compose.yml`) Qdrantille ja
   Meilisearchille; vLLM-palvelu kommentoitu valmiiksi Linux/WSL2-siirtoa
   varten.
 
-### Osittain (rajapinnat paikallaan, ei vielä end-to-end-ajoa)
-
-- **OCR → postprocess → embed → extract -pipeline** (`src/lapua_rag/pipeline.py`)
-  on koodattu, mutta ajamatta kokonaisuutena yhdellekään dokumentille.
-- **Qdrant + BM25 + reranker -hybridihaku** – luokat valmiita, kokonaisen
-  retrieve-ketjun smoke-test tekemättä.
-- **Qwen + LoRA -constrained extract** – `LocalLlmClient` (CPU) ja
-  `RemoteVllmClient` (vLLM) olemassa; ensimmäistä ei ole ajettu livenä.
-
 ### Ei vielä aloitettu
 
 - Multi-tenant-todennus (tenant-kenttä on rakenteessa, ACL-kerros puuttuu).
-- Prometheus-metriikka, auditloki, UI (Streamlit / Next.js).
+- Prometheus-metriikka, auditloki.
 - LLM-as-judge eval-skripti ja Lapuan kultajoukko-dataset.
+- `lapua-llm-v3` retrain (ylikoulutettu abstain, ks. §11) → palautuu kun
+  uusi LoRA julkaistaan, jolloin `LAPUA_ANSWER_MODE=synth` voidaan ottaa
+  käyttöön ja `extract`-silta jää backupiksi.
+- Aggregointi-endpoint (`POST /v1/aggregate`) COUNT-kysymyksille (§11.4).
 
 ### v0.3 · 2026-04-18 – vLLM-synteesi tuotantonopeudella
 
@@ -372,6 +383,8 @@ Täysi suunnitelma + roadmap: [`tmp/rag_system_design.md`](tmp/rag_system_design
 ## 3. Pikakäynnistys
 
 ```powershell
+# Kloonaa repo (uusi GitHub-koti)
+git clone https://github.com/FoxRav/Lapua-RAG-Systeemi.git F:\-DEV-\76.PaddleOCR
 cd F:\-DEV-\76.PaddleOCR
 .\.venv\Scripts\Activate.ps1
 
@@ -461,56 +474,62 @@ samalla pohjamallilla.
 
 ## 5. Seuraavat konkreettiset tehtävät
 
-### Viikko 1 – **Systeemin ensimmäinen dokumentti + SLM live**
+### Tehty (viikot 1–4 tähän mennessä)
 
-1. **Ajoa koko pipeline läpi** jo prosessoidulle *Talouden
-   toteutumaraportti*-PDF:lle: `lapua-rag ingest "<pdf>"`, jonka jälkeen
-   `lapua-rag system stats` näyttää kyseisen dokumentin Systeemissä.
-   Odotettavia ongelmia: Qwen-mallin alkulataus (~3 GB disk), CPU-inferenssin
-   hitaus (10–30 s / chunk), `lm-format-enforcer`-tokenizer-yhteensopivuus.
-2. **Ajaa SLM livenä** `lapua-rag query` -kautta: varmista että
-   `lapua-llm-v2` lataa Qwen2.5:n päälle, `RagAnswer` parsetuu ja
-   closed-book-guard palauttaa abstain-vastauksen kysymykselle jota
-   Systeemistä ei löydy.
-3. **Kirjoittaa smoke-testi `tests/integration/test_pipeline_e2e.py`** joka
+- [x] Pipeline ajettu kokonaisuutena → 109 dokumenttia indeksoitu (v0.3)
+- [x] vLLM WSL2-distrossa live `--enable-lora`-moodissa (v0.3, §10)
+- [x] SLM ajossa `lapua-rag query` -kautta (extract-tila default v0.6 alkaen)
+- [x] Hybridihaku Qdrant + BM25 + reranker validoitu live-korpuksella
+- [x] Closed-book-guard validoitu elävällä mallilla (no_context /
+      below_threshold / model_refused, ks. §11)
+- [x] Frontend (Next.js + shadcn/ui) tuotantolaadulla (v0.5, ks. §12)
+- [x] 69 yksikkötestiä vihreänä, ruff puhdas
+
+### Viikko 1 jäljellä – **integraatiotestaus + kultajoukko**
+
+1. **Kirjoittaa smoke-testi `tests/integration/test_pipeline_e2e.py`** joka
    ajaa koko ketjun pienellä kultadokumentilla ja varmistaa että
    `structured.json` sisältää odotetut pykälät + Systeemin tila muuttuu
    (uusi versiohash, +1 indexed_count).
-4. **Verifioida mojibake-korjaus** ajamalla `consolidate_markdown` tuolle
+2. **Verifioida mojibake-korjaus** ajamalla `consolidate_markdown` yhdelle
    PDF:lle ja diff-vertaamalla `rec_texts`-lähtöiseen tekstiin.
-5. **Luoda kultajoukko** 3–5 dokumentista eri tyypeistä (pöytäkirja,
+3. **Luoda kultajoukko** 3–5 dokumentista eri tyypeistä (pöytäkirja,
    osavuosi, tilinpäätös) → `tests/fixtures/gold/`.
 
 ### Viikko 2 – **laadun mittarointi**
 
-5. **Ajaa 10 todellista Lapua-PDF:ää** eräajona
-   (`lapua-rag ingest-dir data/inbox`).
-   Mittari: OCR-luottamus per dokumentti, ekstraktion pykäläkattavuus,
-   hybridihaun recall@5.
-6. **Virittää chunkkaussäännöt tilinpäätökselle** (taulukkorakenteinen, ei
+4. **Mitata indeksoidun korpuksen laatu**: OCR-luottamus per dokumentti,
+   ekstraktion pykäläkattavuus, hybridihaun recall@5 109-dokumentin
+   korpuksella.
+5. **Virittää chunkkaussäännöt tilinpäätökselle** (taulukkorakenteinen, ei
    pykäliä) – lisätä `postprocess/chunking.py`:hin taulukko-tietoiset
    sliding-windowit.
-7. **Kirjoittaa `scripts/eval_judge.py`** – LLM-as-judge automaattiarviointi
+6. **Kirjoittaa `scripts/eval_judge.py`** – LLM-as-judge automaattiarviointi
    omalla LoRA:lla + referenssinä GPT-4.
 
-### Viikko 3 – **tuotantoketju**
+### Viikko 3 – **tuotantoketju + reranker-laajennus**
 
-8. **Pystyttää vLLM Linux/WSL2-koneeseen** `--enable-lora`-moodissa;
-   aseta `LAPUA_LLM_VLLM_URL=http://wsl:8000/v1` ja mittaa ekstraktion
-   nopeuskasvu (tavoite: 0.2–1 s / chunk vs. 10–30 s CPU:lla).
-9. **Indeksoida 100 dokumenttia** eräajona; ensimmäinen realistinen
-   volyymimittaus.
-10. **Prometheus-metriikka** (`/metrics`-endpoint): `ingest_total`,
-    `ingest_duration_seconds`, `retrieve_hit_rate_at_5`,
-    `llm_generate_duration_seconds`.
+7. **Reranker-parannus** (§11.4): rerank-pool top-K 8 → 20, query-rewrite
+   3 reformulointia, max-pool-pisteytys. Tavoite: ratkaista loputkin
+   hallitus/valtuusto-sekoitukset jotka v0.6.2:n boost ei korjannut.
+8. **Aggregointi-endpoint** `POST /v1/aggregate` (§11.4): COUNT-kysymykset
+   reititetään SQL-pohjaiselle haulle `decisions`-taulusta. UI tunnistaa
+   "kuinka monta/montako" -kuviot ja siirtää kutsun automaattisesti.
+9. **Prometheus-metriikka** (`/metrics`-endpoint): `ingest_total`,
+   `ingest_duration_seconds`, `retrieve_hit_rate_at_5`,
+   `llm_generate_duration_seconds`.
 
 ### Viikko 4 – **demo + myynti**
 
-11. **Streamlit- tai Next.js-UI**: kysymyspalkki, tulosluettelo sitaateilla,
-    klikattavat bbox-highlightit sivu-PNG:iin.
-12. **Asiakasdemo-skenaariot**: "Näytä kaikki kaupunginhallituksen päätökset
-    2024 joita koskevat ympäristönsuojeluluvat", "Mitkä investoinnit ylittyivät
-    budjetissa Q1 aikana?".
+10. **lapua-llm-v3 retrain** (§11): 50/50 abstain/extract data, ≥200
+    positiivista esimerkkiä, validointi 10 kontrollikyselyllä, julkaisu.
+    Sen jälkeen `LAPUA_ANSWER_MODE=synth` voidaan ottaa käyttöön; extract
+    jää backupiksi.
+11. **Asiakasdemo-skenaariot**: "Näytä kaikki kaupunginhallituksen päätökset
+    2024 joita koskevat ympäristönsuojeluluvat", "Mitkä investoinnit
+    ylittyivät budjetissa Q1 aikana?".
+12. **PDF-katsojan bbox-highlightit**: sivu-PNG + reranker-osumakohdan
+    bounding box klikattavana — täydentää nykyistä `pdf-viewer.tsx`-modaalia.
 13. **Air-gap-paketointi**: `docker compose` -stack asiakkaiden koneisiin
     ilman ulkoista verkkoa.
 
@@ -704,6 +723,10 @@ files in `site-packages`** if you duplicate this venv elsewhere.
 ## 9. Reproduce from scratch
 
 ```powershell
+# 0. clone Lapua-RAG-Systeemi itsensä
+git clone https://github.com/FoxRav/Lapua-RAG-Systeemi.git F:\-DEV-\76.PaddleOCR
+cd F:\-DEV-\76.PaddleOCR
+
 # 1. clone upstream (shallow)
 git clone --depth 1 https://github.com/PaddlePaddle/PaddleOCR.git PaddleOCR
 
