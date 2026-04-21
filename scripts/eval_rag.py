@@ -26,7 +26,7 @@ import argparse
 import json
 import time
 from collections.abc import Iterable, Sequence
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Final, Literal, Protocol
 
@@ -40,6 +40,12 @@ DEFAULT_MODE: Final[AnswerMode] = "extract"
 # Hyväksymisrajat v1.0:n acceptance-kriteereistä (README §5).
 _ABSTAIN_TARGET: Final[float] = 0.80
 _EXTRACT_TARGET: Final[float] = 0.70
+# LLM-as-judge kynnys v1.0:ssä (CURSOR_v0.9_OHJE.md §C): ≥ 80 % oikeellinen.
+_JUDGE_TARGET: Final[float] = 0.80
+# Model name inline'd to avoid a hard import path from this script —
+# keeps `python scripts/eval_rag.py --help` cheap on systems that don't
+# have httpx available (although we currently always import httpx).
+_JUDGE_MODEL_NAME: Final[str] = "claude-sonnet-4-20250514"
 
 
 @dataclass(frozen=True, slots=True)
@@ -85,6 +91,11 @@ class EvalResult:
     max_source_score: float
     latency_s: float
     error: str | None = None
+    # LLM-as-judge fields (None when --judge is off or the call failed
+    # before reaching judge_answer).
+    judge_verdict: str | None = None
+    judge_score: float | None = None
+    judge_reason: str | None = None
 
 
 @dataclass(slots=True)
@@ -120,6 +131,22 @@ class EvalSummary:
         if not self.valid:
             return 0.0
         return sum(r.latency_s for r in self.valid) / len(self.valid)
+
+    @property
+    def judged(self) -> list[EvalResult]:
+        return [r for r in self.valid if r.judge_verdict is not None]
+
+    @property
+    def judge_accuracy(self) -> float | None:
+        judged = self.judged
+        if not judged:
+            return None
+        acceptable = sum(
+            1
+            for r in judged
+            if r.judge_verdict in ("correct", "abstain_correct")
+        )
+        return acceptable / len(judged)
 
 
 def load_gold(path: Path) -> list[GoldItem]:
@@ -196,17 +223,32 @@ class _QueryFn(Protocol):
     def __call__(self, *, question: str, mode: AnswerMode) -> dict[str, object]: ...
 
 
+class _JudgeFn(Protocol):
+    def __call__(
+        self,
+        *,
+        question: str,
+        rag_answer: dict[str, object],
+        gold_answer: str | None,
+        should_abstain: bool,
+    ) -> tuple[str, float, str]:
+        """Return ``(verdict, score, reason)`` for one item."""
+
+
 def run_eval(
     gold: Iterable[GoldItem],
     query: _QueryFn,
     mode: AnswerMode,
     *,
     clock: _Clock = time.perf_counter,
+    judge: _JudgeFn | None = None,
 ) -> EvalSummary:
     """Run the scorer loop. ``query`` is injected so tests can stub it.
 
     Network / transport errors are captured per-item and reported in
-    :attr:`EvalSummary.errors`; they do not terminate the batch.
+    :attr:`EvalSummary.errors`; they do not terminate the batch. When
+    ``judge`` is supplied it is called once per successful answer and
+    its verdict attached to the :class:`EvalResult`.
     """
     summary = EvalSummary(mode=mode)
     for item in gold:
@@ -227,7 +269,22 @@ def run_eval(
                 )
             )
             continue
-        summary.results.append(score_answer(answer, item, clock() - started))
+        scored = score_answer(answer, item, clock() - started)
+        if judge is not None:
+            gold_text = " ".join(item.expected_contains) or None
+            verdict, score, reason = judge(
+                question=item.question,
+                rag_answer=answer,
+                gold_answer=gold_text,
+                should_abstain=item.should_abstain,
+            )
+            scored = replace(
+                scored,
+                judge_verdict=verdict,
+                judge_score=score,
+                judge_reason=reason,
+            )
+        summary.results.append(scored)
     return summary
 
 
@@ -247,6 +304,33 @@ def _http_query(api_base: str, timeout: float) -> _QueryFn:
         return payload
 
     return _do_query
+
+
+def _build_judge(anthropic_key: str | None) -> _JudgeFn:
+    """Wrap :func:`lapua_rag.eval.judge.judge_answer` as a :class:`_JudgeFn`.
+
+    Import is deferred so ``--help`` and non-judge runs don't require
+    the ``lapua_rag`` package to be installed on sys.path.
+    """
+    from lapua_rag.eval.judge import judge_answer  # noqa: PLC0415
+
+    def _judge(
+        *,
+        question: str,
+        rag_answer: dict[str, object],
+        gold_answer: str | None,
+        should_abstain: bool,
+    ) -> tuple[str, float, str]:
+        verdict = judge_answer(
+            question=question,
+            rag_answer=rag_answer,
+            gold_answer=gold_answer,
+            should_abstain=should_abstain,
+            api_key=anthropic_key,
+        )
+        return verdict.verdict, verdict.score, verdict.reason
+
+    return _judge
 
 
 def format_summary(summary: EvalSummary) -> str:
@@ -270,6 +354,26 @@ def format_summary(summary: EvalSummary) -> str:
             f"  Extract-tarkkuus:  {rated_correct}/{len(rated)} ({100 * extract_acc:.1f} %)"
         )
     lines.append(f"  Keskim. latenssi:  {summary.average_latency_s:.2f} s")
+
+    judge_acc = summary.judge_accuracy
+    if judge_acc is not None:
+        judged = summary.judged
+        judge_correct = sum(
+            1 for r in judged if r.judge_verdict in ("correct", "abstain_correct")
+        )
+        judge_partial = sum(1 for r in judged if r.judge_verdict == "partial")
+        avg_score = (
+            sum(r.judge_score or 0.0 for r in judged) / len(judged) if judged else 0.0
+        )
+        lines.append("")
+        lines.append(f"  Judge-LLM ({_JUDGE_MODEL_NAME}):")
+        lines.append(
+            f"    Oikein:           {judge_correct}/{len(judged)} "
+            f"({100 * judge_acc:.1f} %)"
+        )
+        lines.append(f"    Osittain:         {judge_partial}/{len(judged)}")
+        lines.append(f"    Keskim. pisteet:  {avg_score:.2f}/1.00")
+
     lines.append("")
     lines.append("Hyväksymisrajat (v1.0):")
     lines.append(
@@ -280,6 +384,11 @@ def format_summary(summary: EvalSummary) -> str:
         lines.append(
             f"  Extract-tarkkuus ≥ {int(100 * _EXTRACT_TARGET)} %: "
             f"{'OK' if extract_acc >= _EXTRACT_TARGET else 'EI OK'}"
+        )
+    if judge_acc is not None:
+        lines.append(
+            f"  Judge-tarkkuus ≥ {int(100 * _JUDGE_TARGET)} %: "
+            f"{'OK' if judge_acc >= _JUDGE_TARGET else 'EI OK'}"
         )
     return "\n".join(lines)
 
@@ -295,6 +404,16 @@ def run_cli(argv: Sequence[str] | None = None) -> int:
         help="Vastaustila",
     )
     parser.add_argument("--timeout", type=float, default=60.0, help="HTTP-timeout sekuntia")
+    parser.add_argument(
+        "--judge",
+        action="store_true",
+        help="Käytä LLM-as-judge arviointia (Anthropic API, ANTHROPIC_API_KEY vaaditaan).",
+    )
+    parser.add_argument(
+        "--anthropic-key",
+        default=None,
+        help="Anthropic-API-avain (tai env ANTHROPIC_API_KEY).",
+    )
     args = parser.parse_args(argv)
     mode: AnswerMode = args.mode
 
@@ -308,7 +427,13 @@ def run_cli(argv: Sequence[str] | None = None) -> int:
     print(f"Kultajoukko: {len(gold)} kysymystä, moodi: {mode}")
     print(f"API: {args.api}\n")
 
-    summary = run_eval(gold, _http_query(args.api, args.timeout), mode)
+    judge_fn = _build_judge(args.anthropic_key) if args.judge else None
+    summary = run_eval(
+        gold,
+        _http_query(args.api, args.timeout),
+        mode,
+        judge=judge_fn,
+    )
     for result in summary.results:
         marker = "✓" if result.abstain_correct else "✗"
         if result.error:
