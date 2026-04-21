@@ -23,9 +23,57 @@ omalla Systeemillä + LoRA-adapterilla per asiakas.
 
 ---
 
-## 1. Tilanneraportti (v0.8.0 · 2026-04-21)
+## 1. Tilanneraportti (v0.9.0 · 2026-04-21)
 
 Repo julkaistu GitHubiin: <https://github.com/FoxRav/Lapua-RAG-Systeemi>.
+
+### v0.9.0 · 2026-04-21 – Multi-tenant ACL + LLM-as-judge + query-rewrite + v1-acceptance
+
+Ohjeen `INSTRUCTIONS FOLDER/CURSOR_v0.9_OHJE.md` tehtävät A–E toteutettu
+valmistelemaan v1.0-julkaisua:
+
+- **v3-koulutusputki (A)** – skriptit `scripts/build_v3_dataset.py` ja
+  `scripts/train_v3_lora.py` valmiina v0.8:sta; v0.9 lisää niille
+  käyttöohjeen `docs/v3_training_pipeline.md` (datasetin rakennus →
+  Unsloth-koulutus → validointikoodi → HF-julkaisu). Varsinainen
+  GPU-ajo on manuaalinen vaihe (`screen -S v3train`, 6–10 h) – ks.
+  myös `CURSOR_v0.9_OHJE.md §A` täydellisille komentoriveille.
+- **Multi-tenant ACL (B)** — uusi `ApiKey`-taulu (SHA-256 key_hash,
+  tenant, label, expires_at, is_active, last_used_at),
+  `src/lapua_rag/api/auth.py::require_api_key`-dependency ja
+  `LAPUA_AUTH_ENABLED`-kytkin. `/v1/query`, `/v1/aggregate` ja
+  `/v1/ingest` vaativat `X-API-Key`-headerin kun auth on päällä;
+  `/healthz`, `/metrics`, `/v1/system/*` ja `/v1/audit` jäävät
+  avoimiksi monitorointia varten. Kehitystilassa (`auth_enabled=false`,
+  default) vanha käytös säilyy täysin yhteensopivana. CLI-aliryhmä
+  `lapua-rag keys create|list|revoke` tuottaa ja hallinnoi avaimia;
+  plaintext-avain näytetään **vain kerran** luonnin yhteydessä.
+- **LLM-as-judge (C)** — `src/lapua_rag/eval/judge.py` kutsuu
+  Anthropicin `claude-sonnet-4-20250514`-mallia ja palauttaa
+  `JudgeVerdict(verdict, score, reason)`. `scripts/eval_rag.py` saa
+  uudet liput `--judge` ja `--anthropic-key`; judgen tulokset
+  näytetään yhteenvedossa (oikein / osittain / keskim. pistemäärä) ja
+  verrataan v1.0-kynnykseen 80 %. Verkkovirheet ja puuttuva avain
+  palauttavat `incorrect`/score 0 ilman että ajo kaatuu.
+- **Query-rewrite (D)** — `src/lapua_rag/retrieve/query_rewrite.py`
+  tuottaa 1–3 heuristista reformulaatiota (alkuperäinen,
+  kysymyssanan strippaus / "kuka on X?"-fraasin noun-extraktio,
+  domain-tag `Lapuan kaupunki`). `HybridRetriever.retrieve()`
+  kierrättää jokaisen variantin läpi dense + sparse -hauista ja
+  max-pool-fusoi RRF:llä. Yhden kyselyn latenssi kasvaa ~linearly
+  varianttien määrällä, mutta top-1-tarkkuus paranee ilman retrainia.
+- **v1.0 acceptance-check (E)** — `scripts/v1_acceptance_check.py` ajaa
+  automaattisesti korpusmittarin (`/v1/system/stats`), Prometheuksen
+  elossa-tsekin, auditlokin saatavuuden, Systeemi-hashin stabiliteetin
+  (kaksi peräkkäistä `/v1/system/version`-kutsua), closed-book-guardin
+  (kaksi off-topic-kysymystä), lähdeviittausten läsnäolon, pytestin,
+  ruffin ja valinnaisen LLM-as-judgen (max 10 API-kutsua, ohitetaan
+  ilman `ANTHROPIC_API_KEY`:tä). Exit code 0 = GO, 1 = NO-GO.
+- **26 uutta yksikkötestiä** (yhteensä **183 vihreänä**, ~12 s): auth
+  happy/revoked/disabled-polut (6), judge-parseri + fallbackit (10),
+  query-rewrite-heuristiikka (10). `ruff check` puhdas, mypy-baseline
+  ennallaan (22 virhettä 12 tiedostossa, uusissa tiedostoissa ei uusia
+  virheitä).
 
 ### v0.8.0 · 2026-04-21 – Observability-loop + auditloki + aggregate-UI
 
@@ -109,6 +157,18 @@ toteutettu ennen `lapua-llm-v3`-retrainia:
 
 ### Valmista (end-to-end ajossa)
 
+- **Multi-tenant ACL (v0.9)** — `ApiKey`-taulu, `require_api_key`
+  -dependency ja `lapua-rag keys create|list|revoke`-CLI. Päällä kun
+  `LAPUA_AUTH_ENABLED=true`; kehityksessä default `false`.
+- **LLM-as-judge runtime (v0.9)** — `scripts/eval_rag.py --judge`
+  kutsuu Anthropicin `claude-sonnet-4-20250514`-mallia ja vertaa
+  judge-accuracyn v1.0-kynnykseen 80 %.
+- **Query-rewrite (v0.9)** — `HybridRetriever` kierrättää 1–3
+  heuristista reformulaatiota dense+sparse-hakujen läpi ja
+  max-pool-fusoi RRF:llä; parantaa top-1-tarkkuutta ilman retrainia.
+- **v1.0 acceptance-check (v0.9)** — `scripts/v1_acceptance_check.py`
+  ajaa korpus / Prometheus / audit / Systeemi-hash / closed-book /
+  lähteet / pytest / ruff / (valinnainen judge) ja raportoi go/no-go.
 - **PaddleOCR-ympäristö pystyssä** (ks. §6). PP-StructureV3 ajettu eräajona
   108 PDF:lle (DATA_päättävät_elimet_20251202), keskimääräinen OCR-luottamus
   > 0.9, GPU NVIDIA RTX 4050 Laptop.
@@ -152,15 +212,16 @@ toteutettu ennen `lapua-llm-v3`-retrainia:
 
 ### Ei vielä aloitettu
 
-- Multi-tenant-todennus (tenant-kenttä on rakenteessa, ACL-kerros puuttuu).
-- LLM-as-judge eval-automaatio (v0.7:n `scripts/eval_rag.py` käyttää
-  substring-match + abstain-lippua; judge-LLM tulee v1.0 acceptance-kuopan
-  osana, §5).
-- `lapua-llm-v3` retrainin varsinainen ajo (ylikoulutettu abstain, ks. §11):
-  `scripts/build_v3_dataset.py` rakentaa datasetin, `scripts/train_v3_lora.py`
-  (v0.8) ajaa Unsloth-LoRA-koulutuksen WSL2:ssa. Palautuu v1.0:aan kun uusi
-  LoRA on julkaistu, jolloin `LAPUA_ANSWER_MODE=synth` voidaan ottaa
-  käyttöön ja `extract`-silta jää backupiksi.
+- `lapua-llm-v3` retrainin varsinainen GPU-ajo (ks. §11): putki
+  valmiina (`scripts/build_v3_dataset.py` + `scripts/train_v3_lora.py`),
+  mutta koulutus itse (6–10 h RTX 4050:llä) on manuaalinen askel
+  WSL2-distrossa. Palautuu v1.0:aan kun uusi LoRA on julkaistu, jolloin
+  `LAPUA_ANSWER_MODE=synth` voidaan ottaa käyttöön ja `extract`-silta
+  jää backupiksi.
+- Korpuslaajennus ≥ 200 dokumenttiin (v1.0 acceptance-kriteeri, §5).
+  Nykyisen 109 dok:n päälle tarvitaan toinen erä Lapuan kaupungin
+  PDF:ää (talousarviot, hallinto, sivistys); `scripts/batch_ingest.py`
+  on valmis ajettavaksi.
 
 ### v0.3 · 2026-04-18 – vLLM-synteesi tuotantonopeudella
 
@@ -516,6 +577,11 @@ lapua-rag ui             # jatkossa  → http://localhost:3000
 | `/metrics`             | GET    | Prometheus-exposition                                |
 | `/healthz`             | GET    | Elossa-tarkistus                                     |
 
+> v0.9+: kun `LAPUA_AUTH_ENABLED=true`, endpointit `/v1/query`,
+> `/v1/aggregate` ja `/v1/ingest` vaativat `X-API-Key`-headerin (luo
+> `lapua-rag keys create <tenant>`-komennolla). `/healthz`, `/metrics`,
+> `/v1/system/*` ja `/v1/audit` jäävät aina auki monitorointia varten.
+
 ### Testit
 
 ```powershell
@@ -625,9 +691,14 @@ samalla pohjamallilla.
 - [ ] Closed-book-guard: 0 hallusinaatiota kultajoukon "off-topic"-kysymyksille
   (SLM abstaineeraa tai palvelu abstaineeraa ennen SLM-kutsua)
 - [ ] LLM-as-judge > 80 % vastauksista "oikeellinen"
+      (v0.9: judge-runtime valmis – `scripts/eval_rag.py --judge` +
+      `scripts/v1_acceptance_check.py`; gate ajetaan kun kultajoukko
+      on 30+ riviä ja `lapua-llm-v3` käytössä)
 - [ ] OCR-luottamus > 0.9 keskimäärin; alle 0.6 päätynyt VL-fallbackiin
 - [ ] `data/storage/` ainoa source-of-truth; indeksit uudelleenrakennettavissa < 1 h
-- [ ] Multi-tenant: sama stack ≥ 2 Systeemiä (asiakasta) ilman koodimuutoksia
+- [x] Multi-tenant: sama stack ≥ 2 Systeemiä (asiakasta) ilman koodimuutoksia
+      (v0.9: `ApiKey`-taulu + `require_api_key`-dependency + `lapua-rag
+      keys`-CLI; aktivoituu `LAPUA_AUTH_ENABLED=true`-asetuksella)
 - [ ] `lapua-rag system version` stabiili: sama Systeemi ⇒ sama hash
 - [ ] CI: ruff + mypy --strict + pytest vihreänä
 - [x] Auditloki: kuka kysyi mitä, milloin, mihin dokumentteihin päätyi
