@@ -9,6 +9,11 @@ from lapua_rag.embed.embedder import Embedder
 from lapua_rag.index.bm25 import BM25Index
 from lapua_rag.index.qdrant import QdrantIndex
 
+# ``lapua_rag.retrieve.query_rewrite`` is imported lazily inside
+# ``HybridRetriever.retrieve`` because ``retrieve/__init__`` re-exports
+# ``SearchService``, which in turn imports ``HybridRetriever`` — a top-
+# level import here would make the module graph circular.
+
 
 def rrf_fuse(
     *,
@@ -34,6 +39,11 @@ class HybridRetriever:
     top_k_dense: int = 30
     top_k_sparse: int = 30
     top_k_fused: int = 30
+    # When True the retriever expands the query via
+    # ``retrieve.query_rewrite.rewrite_query``, runs each variant through
+    # the hybrid pipeline, and max-pools the resulting rankings. Off by
+    # default in tests so the single-query fixtures still work unchanged.
+    enable_query_rewrite: bool = True
 
     def retrieve(
         self,
@@ -42,14 +52,27 @@ class HybridRetriever:
         tenant: str,
         filters: dict[str, Any] | None = None,
     ) -> list[tuple[str, float]]:
-        vector = self.embedder.embed_query(query)
-        dense = self.qdrant.search(
-            vector=vector,
-            top_k=self.top_k_dense,
-            tenant=tenant,
-            filters=filters,
-        )
-        dense_ranked = [(cid, score) for cid, score, _ in dense]
-        sparse = self.bm25.search(query=query, tenant=tenant, top_k=self.top_k_sparse)
-        fused = rrf_fuse(rankings=[dense_ranked, sparse])
+        from lapua_rag.retrieve.query_rewrite import rewrite_query  # noqa: PLC0415
+
+        queries = rewrite_query(query) if self.enable_query_rewrite else [query]
+
+        rankings: list[list[tuple[str, float]]] = []
+        for variant in queries:
+            vector = self.embedder.embed_query(variant)
+            dense = self.qdrant.search(
+                vector=vector,
+                top_k=self.top_k_dense,
+                tenant=tenant,
+                filters=filters,
+            )
+            dense_ranked = [(cid, score) for cid, score, _ in dense]
+            sparse = self.bm25.search(
+                query=variant,
+                tenant=tenant,
+                top_k=self.top_k_sparse,
+            )
+            rankings.append(dense_ranked)
+            rankings.append(sparse)
+
+        fused = rrf_fuse(rankings=rankings)
         return fused[: self.top_k_fused]
