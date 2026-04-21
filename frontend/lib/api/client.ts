@@ -53,6 +53,26 @@ async function request<T>(
   return (await res.json()) as T;
 }
 
+// Aggregate endpoint: COUNT / SUM queries answered directly from the
+// decisions table without going through the RAG pipeline. Result shape
+// mirrors `AggregateResult` in `src/lapua_rag/api/routes/aggregate.py`.
+export type AggregateResultType = "count" | "sum" | "not_supported";
+
+export interface AggregateRequest {
+  query: string;
+  tenant?: string;
+}
+
+export interface AggregateResult {
+  query: string;
+  result_type: AggregateResultType;
+  value: number | null;
+  unit: string | null;
+  entity: string | null;
+  explanation: string;
+  tenant: string;
+}
+
 export const api = {
   async query(payload: {
     query: string;
@@ -60,6 +80,13 @@ export const api = {
     mode?: AnswerMode;
   }): Promise<RagAnswer> {
     return request<RagAnswer>("/v1/query", {
+      method: "POST",
+      body: JSON.stringify(payload),
+    });
+  },
+
+  async aggregate(payload: AggregateRequest): Promise<AggregateResult> {
+    return request<AggregateResult>("/v1/aggregate", {
       method: "POST",
       body: JSON.stringify(payload),
     });
