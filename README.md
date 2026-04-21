@@ -23,9 +23,89 @@ omalla Systeemillä + LoRA-adapterilla per asiakas.
 
 ---
 
-## 1. Tilanneraportti (v0.6.2 · 2026-04-19)
+## 1. Tilanneraportti (v0.8.0 · 2026-04-21)
 
 Repo julkaistu GitHubiin: <https://github.com/FoxRav/Lapua-RAG-Systeemi>.
+
+### v0.8.0 · 2026-04-21 – Observability-loop + auditloki + aggregate-UI
+
+Ohjeen `INSTRUCTIONS FOLDER/CURSOR_v0.8_OHJE.md` tehtävät A–E toteutettu
+ennen `lapua-llm-v3`-julkaisua:
+
+- **Prometheus call-site-instrumentointi** (`src/lapua_rag/rag/answer.py`,
+  `src/lapua_rag/pipeline.py`): `AnswerService.answer()` kirjaa jokaiselle
+  kyselylle `query_total`/`query_duration_seconds`/`retrieve_top_score` +
+  `query_abstained_total`-laskurin. Ingestissä `ingest_total`/
+  `ingest_duration_seconds` kirjautuu myös skip-polulla, ja onnistuneen
+  indeksoinnin jälkeen `corpus_documents_total`/`corpus_chunks_total` päivittyvät
+  `gather_stats()`-kautta. Metriikoiden epäonnistuminen ei koskaan kaada
+  vastauspolkua (`try/except` defensiivisesti).
+- **Auditloki** (`src/lapua_rag/audit/service.py`, `/v1/audit`-endpoint,
+  uusi `AuditLog`-taulu): `/v1/query` ja `/v1/aggregate` kirjaavat taustalla
+  (FastAPI `BackgroundTasks`) kyselyn, tenantin, moodin, abstain-lipun,
+  top-scoren, source-doc-id:t, latenssin, client-IP:n ja User-Agent:n
+  SQLite-tauluun **sekä** `structlog`-JSON-eventtinä. Read-only API:
+  `GET /v1/audit?tenant=…&limit=…` palauttaa uusimmat kirjaukset. Kaikki
+  epäonnistumiset logitetaan, mutta ne eivät koskaan riko pääflowta.
+- **Frontend aggregate-reititys**: uusi `frontend/lib/classify-query.ts`
+  tunnistaa "kuinka monta / paljonko rahaa / summa"-kuviot ja reitittää
+  kyselyn automaattisesti `/v1/aggregate`-endpointiin. Tulos renderöidään
+  uudessa `AggregateCard`-komponentissa (lokaliisoitu numeroformaatti,
+  ikonit, "not_supported"-fallback). Chat-paneelin `ChatTurn` on nyt
+  erottava union (`kind: "rag" | "aggregate"`).
+- **`scripts/train_v3_lora.py`** — Unsloth-pohjainen LoRA-koulutusskripti
+  `lapua-llm-v3`:lle (WSL2). Raskaat ML-importit tehdään `run()`:n sisällä,
+  joten `--help` ja yksikkötestit toimivat ilman GPU-pinoa. `TrainConfig`
+  + `parse_args()` + `load_records()` ovat puhtaita funktioita; Unit-testit
+  kattavat argumenttiparsinnan ja JSONL-lukujen.
+- **`scripts/expand_gold_set.py`** — laajentaa
+  `tests/fixtures/gold/lapua_gold_v1.jsonl`:n 30 riviin: olemassa olevat
+  rivit säilytetään, off-topic-kysymykset (abstain) lisätään, loput
+  täytetään Qdrantista vedetyistä päätös-chunkeista generoiduilla
+  extract-kysymyksillä. `section_id` + lyhyt `doc_id` toimivat
+  dedup-disambiguaattorina, jotta toistuva "## Päätös"-otsikko ei romahduta
+  rivejä yhdeksi.
+- **42 uutta yksikkötestiä** (yhteensä **157 vihreänä**, ~11 s): Prometheus
+  call-site (AnswerService + pipeline), auditpalvelun happy/failure-polku,
+  audit-endpoint, classify-query-funktio, train_v3_lora-parseri,
+  expand_gold_set-generaattori. `ruff check` puhdas, mypy-baseline
+  ennallaan (uusissa tiedostoissa ei uusia virheitä).
+
+### v0.7.0 · 2026-04-21 – Eval-pipeline, aggregate-endpoint, Prometheus
+
+Jatko-ohjeen (`INSTRUCTIONS FOLDER/CURSOR_JATKO-OHJE.md`) tehtävät 1–4 ja 6
+toteutettu ennen `lapua-llm-v3`-retrainia:
+
+- **`scripts/audit_training_data.py`** — luokittelee ChatML-JSONL:n
+  abstain/extract-pareihin, raportoi suhteen ja nostaa varoituksen kun
+  abstain-osuus > 60 % tai < 40 %.
+- **`scripts/build_v3_dataset.py`** — rakentaa balansoidun
+  `data/training/v3_dataset.jsonl`-datasetin Qdrantista. Pure-function
+  osat (`extract_question_from_chunk`, `make_extract_example`,
+  `make_abstain_example`, `build_dataset`) yksikkötestattuja ilman
+  Qdrant-kutsuja.
+- **`tests/fixtures/gold/lapua_gold_v1.jsonl` + `scripts/eval_rag.py`** —
+  10-rivinen seed-kultajoukko + eval-skripti joka ajaa FastAPI:n läpi ja
+  raportoi abstain-tarkkuuden, extract-tarkkuuden, keskilatenssin sekä
+  v1.0-hyväksymisrajat.
+- **`/v1/aggregate`-endpoint** (`src/lapua_rag/api/routes/aggregate.py`):
+  COUNT/SUM-kysymykset reititetään olemassaolevalle `DecisionRow`-taululle
+  SQL:llä. Deterministinen luokittelija + etunimi-sukunimi-heuristiikka
+  entity-ekstraktioon. Taustalla UI-tunnistus tulossa frontendiin
+  erikseen.
+- **Prometheus-metriikka** (`src/lapua_rag/observability/metrics.py`):
+  `/metrics`-endpoint tuottaa tekstimuotoisen exposition seitsemälle
+  instrumentille (`lapua_rag_ingest_total`, `..._ingest_duration_seconds`,
+  `..._query_total`, `..._query_duration_seconds`,
+  `..._retrieve_top_score`, `..._corpus_documents_total`,
+  `..._corpus_chunks_total`). Oma `CollectorRegistry` jotta MCP-sidecar
+  ja testit eivät kolaroi globaaliin rekisteriin.
+- **61 uutta yksikkötestiä** (yhteensä **130 vihreinä**, ~5 s); ruff
+  puhdas, mypy puhdas uusissa tiedostoissa (aggregate-endpoint käyttää
+  `sqlmodel.col()`-apuria strict-tarkistuksen toteuttamiseksi).
+- **Suunnitelma** `tmp/jatko_plan_2026-04-21.md` kuvaa mitä tehtiin ja
+  mitkä ohjeen kohdat (v3-koulutus, batch-ingest-lisäerät, frontendin
+  aggregate-reititin) jäivät seuraavaan iteraatioon.
 
 ### Valmista (end-to-end ajossa)
 
@@ -73,12 +153,14 @@ Repo julkaistu GitHubiin: <https://github.com/FoxRav/Lapua-RAG-Systeemi>.
 ### Ei vielä aloitettu
 
 - Multi-tenant-todennus (tenant-kenttä on rakenteessa, ACL-kerros puuttuu).
-- Prometheus-metriikka, auditloki.
-- LLM-as-judge eval-skripti ja Lapuan kultajoukko-dataset.
-- `lapua-llm-v3` retrain (ylikoulutettu abstain, ks. §11) → palautuu kun
-  uusi LoRA julkaistaan, jolloin `LAPUA_ANSWER_MODE=synth` voidaan ottaa
+- LLM-as-judge eval-automaatio (v0.7:n `scripts/eval_rag.py` käyttää
+  substring-match + abstain-lippua; judge-LLM tulee v1.0 acceptance-kuopan
+  osana, §5).
+- `lapua-llm-v3` retrainin varsinainen ajo (ylikoulutettu abstain, ks. §11):
+  `scripts/build_v3_dataset.py` rakentaa datasetin, `scripts/train_v3_lora.py`
+  (v0.8) ajaa Unsloth-LoRA-koulutuksen WSL2:ssa. Palautuu v1.0:aan kun uusi
+  LoRA on julkaistu, jolloin `LAPUA_ANSWER_MODE=synth` voidaan ottaa
   käyttöön ja `extract`-silta jää backupiksi.
-- Aggregointi-endpoint (`POST /v1/aggregate`) COUNT-kysymyksille (§11.4).
 
 ### v0.3 · 2026-04-18 – vLLM-synteesi tuotantonopeudella
 
@@ -429,6 +511,9 @@ lapua-rag ui             # jatkossa  → http://localhost:3000
 | `/v1/system/stats`     | GET    | Systeemin määrät per tenant                          |
 | `/v1/system/version`   | GET    | Deterministinen Systeemi-hash (cache-avain)          |
 | `/v1/system/coverage`  | GET    | Kattavuus per `doc_type` + jumissa olevat ingest-työt |
+| `/v1/aggregate`        | POST   | COUNT/SUM-kysymykset SQL:llä `decisions`-taulusta (ei RAG) |
+| `/v1/audit`            | GET    | Viimeisten kyselyjen auditloki (read-only)           |
+| `/metrics`             | GET    | Prometheus-exposition                                |
 | `/healthz`             | GET    | Elossa-tarkistus                                     |
 
 ### Testit
@@ -545,7 +630,8 @@ samalla pohjamallilla.
 - [ ] Multi-tenant: sama stack ≥ 2 Systeemiä (asiakasta) ilman koodimuutoksia
 - [ ] `lapua-rag system version` stabiili: sama Systeemi ⇒ sama hash
 - [ ] CI: ruff + mypy --strict + pytest vihreänä
-- [ ] Auditloki: kuka kysyi mitä, milloin, mihin dokumentteihin päätyi
+- [x] Auditloki: kuka kysyi mitä, milloin, mihin dokumentteihin päätyi
+      (v0.8: SQLite `audit_log` + `structlog` + `GET /v1/audit`)
 
 ---
 
