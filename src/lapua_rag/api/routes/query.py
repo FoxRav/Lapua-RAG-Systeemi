@@ -2,11 +2,13 @@
 
 from __future__ import annotations
 
+import time
 from functools import lru_cache
 
-from fastapi import APIRouter
+from fastapi import APIRouter, BackgroundTasks, Request
 from pydantic import BaseModel, Field
 
+from lapua_rag.audit.service import log_query
 from lapua_rag.config import get_settings
 from lapua_rag.embed.embedder import Embedder
 from lapua_rag.extract.llm import default_client
@@ -30,11 +32,33 @@ class QueryRequest(BaseModel):
 
 
 @router.post("/query", response_model=RagAnswer)
-def query(request: QueryRequest) -> RagAnswer:
+def query(
+    request: QueryRequest,
+    background_tasks: BackgroundTasks,
+    http_request: Request,
+) -> RagAnswer:
     settings = get_settings()
     mode: AnswerMode = request.mode or settings.answer_mode
+    tenant = request.tenant or settings.tenant
     svc = _answer_service(mode)
-    return svc.answer(query=request.query, tenant=request.tenant or settings.tenant)
+
+    started = time.perf_counter()
+    answer = svc.answer(query=request.query, tenant=tenant)
+    latency_ms = int((time.perf_counter() - started) * 1000)
+
+    client = http_request.client
+    background_tasks.add_task(
+        log_query,
+        tenant=tenant,
+        endpoint="/v1/query",
+        query_text=request.query,
+        answer=answer,
+        mode=mode,
+        latency_ms=latency_ms,
+        client_ip=client.host if client is not None else None,
+        user_agent=http_request.headers.get("user-agent"),
+    )
+    return answer
 
 
 @lru_cache(maxsize=3)

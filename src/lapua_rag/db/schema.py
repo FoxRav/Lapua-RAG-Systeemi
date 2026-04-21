@@ -76,3 +76,33 @@ class DecisionRow(SQLModel, table=True):  # type: ignore[call-arg]
     paivamaara: date | None = Field(default=None, index=True)
     sivu: int = 0
     payload: dict[str, Any] = Field(default_factory=dict, sa_column=Column(JSON))
+
+
+class AuditLog(SQLModel, table=True):  # type: ignore[call-arg]
+    """Append-only audit trail for /v1/query and /v1/aggregate calls.
+
+    Captures who asked what, when, which documents were cited, and
+    whether the service abstained. Supports the "kuka kysyi mitä,
+    milloin" v1.0 requirement without storing PII in log streams.
+    """
+
+    __tablename__ = "audit_log"
+
+    id: int | None = Field(default=None, primary_key=True)
+    ts: datetime = Field(default_factory=datetime.utcnow, index=True)
+
+    tenant: str = Field(index=True, max_length=64)
+    endpoint: str = Field(max_length=64)
+    query_text: str
+    mode: str | None = Field(default=None, max_length=16)
+
+    abstained: bool = False
+    abstain_reason: str | None = Field(default=None, max_length=32)
+    max_source_score: float | None = None
+    # JSON-encoded list of doc_ids (kept as text for portability — SQLite
+    # JSON support is recent; no queries rely on inner structure yet).
+    source_doc_ids: str | None = None
+    latency_ms: int | None = None
+
+    client_ip: str | None = Field(default=None, max_length=64)
+    user_agent: str | None = Field(default=None, max_length=256)

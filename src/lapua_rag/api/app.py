@@ -6,10 +6,11 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
 from lapua_rag import __version__
-from lapua_rag.api.routes import documents, ingest, query, system
+from lapua_rag.api.routes import aggregate, audit, documents, ingest, query, system
 from lapua_rag.config import get_settings
 from lapua_rag.db.session import create_all
 from lapua_rag.observability import configure_logging
+from lapua_rag.observability.metrics import router as metrics_router
 
 
 def create_app() -> FastAPI:
@@ -34,6 +35,9 @@ def create_app() -> FastAPI:
     app.include_router(query.router, prefix="/v1", tags=["query"])
     app.include_router(documents.router, prefix="/v1", tags=["documents"])
     app.include_router(system.router, prefix="/v1", tags=["system"])
+    app.include_router(aggregate.router, prefix="/v1", tags=["aggregate"])
+    app.include_router(audit.router, prefix="/v1", tags=["audit"])
+    app.include_router(metrics_router)
 
     @app.get("/healthz")
     def healthz() -> dict[str, str]:
