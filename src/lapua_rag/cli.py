@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import json
 import os
+import secrets
 import shutil
 import subprocess
 from pathlib import Path
@@ -23,11 +24,14 @@ import typer
 import uvicorn
 from rich import print as rprint
 from rich.table import Table
+from sqlmodel import col, select
 
 from lapua_rag.api.app import create_app
+from lapua_rag.api.auth import hash_api_key
 from lapua_rag.api.routes.query import _answer_service
 from lapua_rag.config import get_settings
-from lapua_rag.db.session import create_all
+from lapua_rag.db.schema import ApiKey
+from lapua_rag.db.session import create_all, session_scope
 from lapua_rag.embed.embedder import Embedder
 from lapua_rag.index.qdrant import QdrantIndex
 from lapua_rag.observability import configure_logging
@@ -38,6 +42,10 @@ from lapua_rag.systeemi.versioning import ModelFingerprint
 app = typer.Typer(help="Lapua-RAG command line interface")
 system_app = typer.Typer(help="Inspect Systeemi: stats, version, coverage")
 app.add_typer(system_app, name="system")
+keys_app = typer.Typer(help="Manage tenant-scoped API keys.")
+app.add_typer(keys_app, name="keys")
+
+_API_KEY_PREFIX = "lrag_"
 
 
 @app.callback()
@@ -254,6 +262,77 @@ def system_coverage_cmd(tenant: str | None = None) -> None:
     rprint(table)
     if report.missing_recent:
         rprint(f"[yellow]Stuck > 24h:[/yellow] {', '.join(report.missing_recent)}")
+
+
+@keys_app.command("create")
+def keys_create(
+    tenant: str = typer.Argument(..., help="Tenant slug, e.g. 'lapua'."),
+    label: str = typer.Option("", help="Human-readable label for the key."),
+) -> None:
+    """Generate a new API key for ``tenant`` and print it ONCE.
+
+    The plaintext key is only ever shown here; only its SHA-256 hash is
+    persisted. Store it somewhere safe — it cannot be recovered later.
+    """
+    create_all()
+    raw_key = f"{_API_KEY_PREFIX}{secrets.token_urlsafe(32)}"
+    row = ApiKey(key_hash=hash_api_key(raw_key), tenant=tenant, label=label)
+    with session_scope() as session:
+        session.add(row)
+    rprint(f"[green]API key created for tenant '{tenant}':[/green]")
+    rprint(f"  {raw_key}")
+    rprint("\n[yellow]Tallenna tämä nyt — ei näytetä uudelleen.[/yellow]")
+    rprint(
+        "Käyttö: "
+        f"curl -H 'X-API-Key: {raw_key}' http://localhost:8080/v1/query ...",
+    )
+
+
+@keys_app.command("list")
+def keys_list(tenant: str | None = None) -> None:
+    """List API keys (hashes + metadata, never plaintext)."""
+    create_all()
+    with session_scope() as session:
+        stmt = select(ApiKey).order_by(col(ApiKey.created_at).desc())
+        if tenant is not None:
+            stmt = stmt.where(col(ApiKey.tenant) == tenant)
+        keys = session.exec(stmt).all()
+        if not keys:
+            rprint("[dim]Ei avaimia.[/dim]")
+            return
+        table = Table(title="API keys")
+        table.add_column("id", justify="right")
+        table.add_column("tenant")
+        table.add_column("label")
+        table.add_column("active")
+        table.add_column("created")
+        table.add_column("last used")
+        for key in keys:
+            table.add_row(
+                str(key.id),
+                key.tenant,
+                key.label or "—",
+                "✓" if key.is_active else "✗",
+                key.created_at.strftime("%Y-%m-%d"),
+                key.last_used_at.strftime("%Y-%m-%d") if key.last_used_at else "—",
+            )
+    rprint(table)
+
+
+@keys_app.command("revoke")
+def keys_revoke(
+    key_id: int = typer.Argument(..., help="Key ID from `lapua-rag keys list`."),
+) -> None:
+    """Deactivate an API key (soft delete — row is kept for audit)."""
+    create_all()
+    with session_scope() as session:
+        key = session.get(ApiKey, key_id)
+        if key is None:
+            rprint(f"[red]No API key with id {key_id}.[/red]")
+            raise typer.Exit(code=1)
+        key.is_active = False
+        session.add(key)
+    rprint(f"[green]API key {key_id} revoked.[/green]")
 
 
 if __name__ == "__main__":  # pragma: no cover

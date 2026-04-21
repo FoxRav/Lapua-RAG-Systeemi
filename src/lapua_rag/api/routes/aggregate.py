@@ -15,13 +15,14 @@ from __future__ import annotations
 
 import re
 import time
-from typing import Final, Literal
+from typing import Annotated, Final, Literal
 
-from fastapi import APIRouter, BackgroundTasks, Request
+from fastapi import APIRouter, BackgroundTasks, Depends, Request
 from pydantic import BaseModel, ConfigDict, Field
 from sqlalchemy import or_
 from sqlmodel import col, func, select
 
+from lapua_rag.api.auth import require_api_key
 from lapua_rag.audit.service import log_entry
 from lapua_rag.config import get_settings
 from lapua_rag.db.schema import DecisionRow, DocumentRow
@@ -143,9 +144,10 @@ def aggregate(
     request: AggregateRequest,
     background_tasks: BackgroundTasks,
     http_request: Request,
+    auth_tenant: Annotated[str, Depends(require_api_key)],
 ) -> AggregateResult:
     settings = get_settings()
-    tenant = request.tenant or settings.tenant
+    tenant = auth_tenant if settings.auth_enabled else (request.tenant or auth_tenant)
     agg_type, entity = classify_aggregate_query(request.query)
 
     started = time.perf_counter()

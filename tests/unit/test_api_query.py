@@ -51,6 +51,10 @@ class _StubSettings:
 
     answer_mode = "synth"
     tenant = "lapua"
+    # v0.9: the route inspects auth_enabled to decide whether the
+    # request-body tenant is honoured. Disable it here so the legacy
+    # behaviour (body.tenant or settings.tenant) still applies.
+    auth_enabled = False
 
 
 def _stub_settings() -> _StubSettings:

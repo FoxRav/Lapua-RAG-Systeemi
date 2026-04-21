@@ -4,10 +4,12 @@ from __future__ import annotations
 
 import time
 from functools import lru_cache
+from typing import Annotated
 
-from fastapi import APIRouter, BackgroundTasks, Request
+from fastapi import APIRouter, BackgroundTasks, Depends, Request
 from pydantic import BaseModel, Field
 
+from lapua_rag.api.auth import require_api_key
 from lapua_rag.audit.service import log_query
 from lapua_rag.config import get_settings
 from lapua_rag.embed.embedder import Embedder
@@ -36,10 +38,13 @@ def query(
     request: QueryRequest,
     background_tasks: BackgroundTasks,
     http_request: Request,
+    auth_tenant: Annotated[str, Depends(require_api_key)],
 ) -> RagAnswer:
     settings = get_settings()
     mode: AnswerMode = request.mode or settings.answer_mode
-    tenant = request.tenant or settings.tenant
+    # When auth is enabled the bound tenant wins; the request-body
+    # field is only honoured in dev mode for backwards-compat scripts.
+    tenant = auth_tenant if settings.auth_enabled else (request.tenant or auth_tenant)
     svc = _answer_service(mode)
 
     started = time.perf_counter()

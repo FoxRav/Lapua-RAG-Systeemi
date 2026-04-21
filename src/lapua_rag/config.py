@@ -109,6 +109,12 @@ class Settings(BaseSettings):
     log_level: Literal["DEBUG", "INFO", "WARNING", "ERROR"] = "INFO"
     log_format: Literal["json", "console"] = "json"
 
+    # Auth --------------------------------------------------------------
+    # False = dev/demo mode (auth bypassed, requests resolve to
+    # ``tenant``). True = production — every mutating or tenant-scoped
+    # endpoint requires a valid X-API-Key header.
+    auth_enabled: bool = False
+
     @field_validator("storage_root", "inbox_dir", "index_dir", mode="after")
     @classmethod
     def _ensure_dir(cls, value: Path) -> Path:

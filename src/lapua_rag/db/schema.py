@@ -78,6 +78,30 @@ class DecisionRow(SQLModel, table=True):  # type: ignore[call-arg]
     payload: dict[str, Any] = Field(default_factory=dict, sa_column=Column(JSON))
 
 
+class ApiKey(SQLModel, table=True):  # type: ignore[call-arg]
+    """Tenant-scoped API key.
+
+    Raw keys are never stored — only the SHA-256 hash. Creation returns
+    the plaintext key once (via ``lapua-rag keys create``); the operator
+    is responsible for persisting it outside Systeemi.
+
+    ``is_active`` is soft-delete: revoked rows are kept for audit
+    trail purposes (so ``AuditLog.tenant`` lookups still resolve
+    meaningfully for historical queries).
+    """
+
+    __tablename__ = "api_keys"
+
+    id: int | None = Field(default=None, primary_key=True)
+    key_hash: str = Field(unique=True, index=True, max_length=64)
+    tenant: str = Field(index=True, max_length=64)
+    label: str = Field(default="", max_length=128)
+    created_at: datetime = Field(default_factory=datetime.utcnow, index=True)
+    expires_at: datetime | None = Field(default=None, index=True)
+    is_active: bool = Field(default=True, index=True)
+    last_used_at: datetime | None = None
+
+
 class AuditLog(SQLModel, table=True):  # type: ignore[call-arg]
     """Append-only audit trail for /v1/query and /v1/aggregate calls.
 
