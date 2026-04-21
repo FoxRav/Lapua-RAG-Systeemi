@@ -28,6 +28,7 @@ from __future__ import annotations
 
 import json
 import re
+import time
 from dataclasses import dataclass
 from typing import Literal
 
@@ -35,6 +36,7 @@ from pydantic import BaseModel, ConfigDict, Field, ValidationError
 
 from lapua_rag.extract.llm import LlmClient
 from lapua_rag.observability import get_logger
+from lapua_rag.observability.metrics import get_instruments
 from lapua_rag.retrieve.search import RetrievalResult, SearchService
 
 _log = get_logger(__name__)
@@ -433,6 +435,23 @@ class AnswerService:
     extract_max_new_tokens: int = 256
 
     def answer(self, *, query: str, tenant: str) -> RagAnswer:
+        t_start = time.perf_counter()
+        result = self._dispatch(query=query, tenant=tenant)
+        duration_s = time.perf_counter() - t_start
+        # Fire-and-forget: metric recording must never break the answer path.
+        try:
+            get_instruments().record_query(
+                tenant=tenant,
+                mode=self.mode,
+                abstained=result.abstained,
+                duration_s=duration_s,
+                top_score=result.max_source_score,
+            )
+        except Exception:  # pragma: no cover - defensive
+            _log.warning("rag.metrics_record_failed", tenant=tenant, mode=self.mode)
+        return result
+
+    def _dispatch(self, *, query: str, tenant: str) -> RagAnswer:
         results = self.search.search(query=query, tenant=tenant)
 
         gate = self._gate(results=results, tenant=tenant)

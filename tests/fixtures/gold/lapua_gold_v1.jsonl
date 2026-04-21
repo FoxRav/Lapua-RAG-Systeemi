@@ -1,0 +1,10 @@
+{"question": "Kuka on Lapuan kaupunginhallituksen puheenjohtaja?", "expected_contains": ["Kai Pöntinen"], "doc_type": "poytakirja", "should_abstain": false}
+{"question": "Kuka on Lapuan kaupunginjohtaja?", "expected_contains": ["Satu Kankare"], "doc_type": "poytakirja", "should_abstain": false}
+{"question": "Kuka valittiin Jytyn pääluottamusmieheksi Lapualla kaudelle 2025-2028?", "expected_contains": ["Samuli Taivalmaa"], "doc_type": "poytakirja", "should_abstain": false}
+{"question": "Mikä on Helsingin pormestarin nimi?", "expected_contains": [], "doc_type": "any", "should_abstain": true}
+{"question": "Kuinka paljon Suomen valtio käytti puolustukseen 2020?", "expected_contains": [], "doc_type": "any", "should_abstain": true}
+{"question": "Milloin Suomi liittyi Euroopan unioniin?", "expected_contains": [], "doc_type": "any", "should_abstain": true}
+{"question": "Kuka voitti viime vuoden SM-liigan?", "expected_contains": [], "doc_type": "any", "should_abstain": true}
+{"question": "Mikä on Tampereen kaupunginjohtajan nimi?", "expected_contains": [], "doc_type": "any", "should_abstain": true}
+{"question": "Kuinka monessa päätöksessä Sami Kuula on ollut mukana?", "expected_contains": [], "doc_type": "any", "should_abstain": true}
+{"question": "Paljonko Lapuan kaupungin bruttokansantuote on?", "expected_contains": [], "doc_type": "any", "should_abstain": true}

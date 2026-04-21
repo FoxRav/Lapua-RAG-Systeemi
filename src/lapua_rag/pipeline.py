@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import json
 import shutil
+import time
 from dataclasses import dataclass
 from datetime import date, datetime
 from pathlib import Path
@@ -24,11 +25,13 @@ from lapua_rag.index.qdrant import QdrantIndex
 from lapua_rag.ingest.dedup import compute_sha256, doc_id_from_sha256
 from lapua_rag.models.document import DocumentStatus, DocumentType
 from lapua_rag.observability import bind_correlation_id, get_logger
+from lapua_rag.observability.metrics import get_instruments
 from lapua_rag.ocr.pipeline import OcrPipeline
 from lapua_rag.postprocess.chunking import chunk_document, chunk_id
 from lapua_rag.postprocess.consolidate import consolidate_markdown
 from lapua_rag.postprocess.doctype import detect_doc_type
 from lapua_rag.storage.layout import DocumentLayout
+from lapua_rag.systeemi.stats import gather_stats
 
 _log = get_logger(__name__)
 
@@ -58,6 +61,7 @@ class LapuaPipeline:
         tenant: str | None = None,
         skip_extract: bool = False,
     ) -> IngestResult:
+        t_start = time.perf_counter()
         settings = get_settings()
         tenant = tenant or settings.tenant
         create_all()
@@ -69,6 +73,12 @@ class LapuaPipeline:
         existing = _lookup(doc_id)
         if existing is not None and existing.status == DocumentStatus.INDEXED.value:
             _log.info("pipeline.skip_already_indexed", doc_id=doc_id)
+            _record_ingest_metrics(
+                tenant=tenant,
+                doc_type=existing.doc_type,
+                status="skipped",
+                duration_s=time.perf_counter() - t_start,
+            )
             return IngestResult(
                 doc_id=doc_id,
                 status=DocumentStatus.INDEXED,
@@ -149,6 +159,13 @@ class LapuaPipeline:
 
         _set_status(doc_id, DocumentStatus.INDEXED)
         _log.info("pipeline.indexed", doc_id=doc_id, chunks=len(chunk_rows))
+        _record_ingest_metrics(
+            tenant=tenant,
+            doc_type=doc_type.value,
+            status="indexed",
+            duration_s=time.perf_counter() - t_start,
+        )
+        _update_corpus_gauges(tenant=tenant)
         return IngestResult(
             doc_id=doc_id,
             status=DocumentStatus.INDEXED,
@@ -274,6 +291,42 @@ def _chunk_payload(row: ChunkRow) -> dict[str, object]:
         "section_title": row.section_title,
         "doc_type": row.doc_type,
     }
+
+
+def _record_ingest_metrics(
+    *,
+    tenant: str,
+    doc_type: str,
+    status: str,
+    duration_s: float,
+) -> None:
+    """Update Prometheus counters for a single ingest outcome.
+
+    Defensive: metric failures (e.g. in tests where the process-wide
+    registry was torn down) must never surface as an ingest error.
+    """
+    try:
+        get_instruments().record_ingest(
+            tenant=tenant,
+            doc_type=doc_type,
+            status=status,
+            duration_s=duration_s,
+        )
+    except Exception:  # pragma: no cover - defensive
+        _log.warning("pipeline.metrics_record_failed", tenant=tenant, doc_type=doc_type)
+
+
+def _update_corpus_gauges(*, tenant: str) -> None:
+    """Refresh the corpus gauges after a successful indexing run."""
+    try:
+        stats = gather_stats(tenant=tenant)
+        get_instruments().set_corpus_size(
+            tenant=tenant,
+            documents=stats.document_count,
+            chunks=stats.chunk_count,
+        )
+    except Exception:  # pragma: no cover - defensive
+        _log.warning("pipeline.corpus_gauge_failed", tenant=tenant)
 
 
 def build_default() -> LapuaPipeline:
